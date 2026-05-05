@@ -36,7 +36,7 @@ jobs:
           PASSWORD: ${{ github.event.inputs.password }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 p7zip-full
+          sudo apt-get install -y -qq aria2 zip unzip
           
           mkdir -p downloads
           cd downloads
@@ -58,36 +58,33 @@ jobs:
             echo "URL: $url"
             echo ""
             
-            # Try to download with multiple tools
+            # Try to download
             downloaded=false
             
-            # Try aria2 first
             if aria2c -q -x4 -s4 --max-tries=3 --timeout=60 \
               --dir=. --out="$filename" "$url" 2>/dev/null; then
               if [ -s "$filename" ]; then
                 downloaded=true
-                echo "Downloaded with aria2"
+                echo "OK: Downloaded with aria2"
               fi
             fi
             
-            # Try wget
             if [ "$downloaded" = false ]; then
-              if wget -q --show-progress --tries=3 --timeout=60 \
-                -U "Mozilla/5.0" -O "$filename" "$url" 2>&1; then
+              if wget -q --tries=3 --timeout=60 \
+                -U "Mozilla/5.0" -O "$filename" "$url" 2>/dev/null; then
                 if [ -s "$filename" ]; then
                   downloaded=true
-                  echo "Downloaded with wget"
+                  echo "OK: Downloaded with wget"
                 fi
               fi
             fi
             
-            # Try curl
             if [ "$downloaded" = false ]; then
               if curl -L -# --retry 3 --connect-timeout 30 \
-                -A "Mozilla/5.0" -o "$filename" "$url" 2>&1; then
+                -A "Mozilla/5.0" -o "$filename" "$url" 2>/dev/null; then
                 if [ -s "$filename" ]; then
                   downloaded=true
-                  echo "Downloaded with curl"
+                  echo "OK: Downloaded with curl"
                 fi
               fi
             fi
@@ -97,35 +94,118 @@ jobs:
               size_mb=$((size / 1024 / 1024))
               echo "Size: ${size_mb} MB"
               
-              # Compress if requested
-              if [ "$COMPRESS" = "true" ] && [ "${filename##*.}" != "zip" ]; then
-                zipname="${filename}.zip"
-                if [ -n "$PASSWORD" ]; then
-                  7z a -tzip -p"$PASSWORD" "$zipname" "$filename" > /dev/null 2>&1
-                else
-                  7z a -tzip "$zipname" "$filename" > /dev/null 2>&1
-                fi
+              # Compress if needed
+              if [ "$COMPRESS" = "true" ]; then
+                ext="${filename##*.}"
+                ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
                 
-                if [ -s "$zipname" ]; then
-                  rm "$filename"
-                  filename="$zipname"
-                  size=$(stat -c%s "$filename" 2>/dev/null || echo 0)
-                  echo "Compressed: $(($size / 1024 / 1024)) MB"
+                if [ "$ext_lower" != "zip" ] && [ "$ext_lower" != "rar" ] && [ "$ext_lower" != "7z" ]; then
+                  echo "Compressing to ZIP..."
+                  zipname="${filename}.zip"
+                  
+                  if [ -n "$PASSWORD" ]; then
+                    zip -P "$PASSWORD" "$zipname" "$filename" 2>/dev/null
+                  else
+                    zip "$zipname" "$filename" 2>/dev/null
+                  fi
+                  
+                  if [ -s "$zipname" ]; then
+                    rm "$filename"
+                    filename="$zipname"
+                    size=$(stat -c%s "$filename" 2>/dev/null || echo 0)
+                    size_mb=$((size / 1024 / 1024))
+                    echo "Compressed: ${size_mb} MB"
+                  fi
                 fi
               fi
               
               # Split if > 90MB
               if [ "$size" -gt 94371840 ]; then
                 echo "Splitting into 90MB parts..."
-                7z a -tzip -v90m "${filename}.7z" "$filename" > /dev/null 2>&1
-                if ls "${filename}.7z".* >/dev/null 2>&1; then
+                
+                # Create folder for parts
+                base="${filename%.*}"
+                mkdir -p "${base}_parts"
+                
+                # Split file
+                split -b 90M -d "$filename" "${base}_parts/${base}.part"
+                
+                if [ $? -eq 0 ]; then
+                  # Rename parts
+                  cd "${base}_parts"
+                  n=1
+                  for part in *.part*; do
+                    newname=$(printf "${base}.%03d" $n)
+                    mv "$part" "$newname"
+                    n=$((n + 1))
+                  done
+                  
+                  total=$((n - 1))
+                  cd ..
+                  
+                  # Remove original
                   rm "$filename"
-                  echo "Split into $(ls -1 "${filename}.7z".* 2>/dev/null | wc -l) parts"
+                  
+                  echo "Split into ${total} parts"
+                  
+                  # Create join script
+                  cat > "${base}_parts/README.md" << EOF
+          # Split File: $filename
+          
+          Original size: ${size_mb} MB
+          Parts: ${total} × 90MB
+          
+          ## How to Join
+          
+          ### Windows
+          \`\`\`cmd
+          copy /b ${base}.001 + ${base}.002 + ${base}.003 ${filename}
+          \`\`\`
+          
+          ### Mac/Linux
+          \`\`\`bash
+          cat ${base}.* > ${filename}
+          \`\`\`
+          
+          ### Android (Termux)
+          \`\`\`bash
+          cat ${base}.* > ${filename}
+          \`\`\`
+          
+          ### iOS
+          Transfer to computer first
+          EOF
+                  
+                  # Create Windows batch file
+                  {
+                    echo "@echo off"
+                    echo "echo Joining ${total} parts..."
+                    printf "copy /b "
+                    for i in $(seq 1 $total); do
+                      printf "${base}.%03d" $i
+                      [ $i -lt $total ] && printf "+"
+                    done
+                    echo " ${filename}"
+                    echo "echo Done!"
+                    echo "pause"
+                  } > "${base}_parts/join.bat"
+                  
+                  # Create Linux/Mac script
+                  {
+                    echo "#!/bin/bash"
+                    echo "echo 'Joining ${total} parts...'"
+                    echo "cat ${base}.* > ${filename}"
+                    echo "echo 'Done!'"
+                  } > "${base}_parts/join.sh"
+                  chmod +x "${base}_parts/join.sh"
+                  
+                else
+                  echo "Split failed - keeping original file"
                 fi
               fi
               
               success=$((success + 1))
-              echo "OK"
+              echo "DONE"
             else
               failed=$((failed + 1))
               echo "FAILED"
@@ -138,16 +218,26 @@ jobs:
           cd ..
           
           echo "========================================="
-          echo "Results: $success downloaded, $failed failed"
+          echo "Results: $success done, $failed failed"
           echo "========================================="
           
-          # Create report
-          echo "# Downloads" > downloads/README.md
-          echo "" >> downloads/README.md
-          echo "Date: $(date)" >> downloads/README.md
-          echo "" >> downloads/README.md
-          echo "## Files" >> downloads/README.md
-          ls -lh downloads/ >> downloads/README.md 2>/dev/null
+          # Create main README
+          {
+            echo "# 📥 Downloaded Files"
+            echo ""
+            echo "Date: $(date)"
+            echo ""
+            echo "## Files"
+            echo ""
+            find downloads -type f ! -name "README.md" ! -name "*.bat" ! -name "*.sh" -exec ls -lh {} \; 2>/dev/null | while read line; do
+              echo "$line"
+            done
+            echo ""
+            echo "## Notes"
+            echo "- Split files need to be joined first"
+            echo "- Run join.bat (Windows) or join.sh (Mac/Linux)"
+            echo "- Android: Use Termux or transfer to PC"
+          } > downloads/README.md
 
       - name: Save to Repository
         if: always()
@@ -161,23 +251,17 @@ jobs:
             exit 0
           fi
           
-          git commit -m "📥 Download update [skip ci]" 2>/dev/null || true
+          git commit -m "📥 Download [skip ci]" 2>/dev/null || true
           git pull --rebase 2>/dev/null || true
-          git push 2>/dev/null || echo "Push failed"
+          git push 2>/dev/null || echo "Push skipped"
           
-          echo "Files saved!"
+          echo "Saved!"
 
-      - name: Show Results
+      - name: Done
         if: always()
         run: |
           echo ""
           echo "=============================="
-          echo " DOWNLOAD COMPLETE"
+          echo " COMPLETE"
           echo "=============================="
-          echo ""
-          if [ -d "downloads" ]; then
-            echo "Downloaded files:"
-            find downloads -type f ! -name "README.md" -exec ls -lh {} \;
-          else
-            echo "No files downloaded"
-          fi
+          find downloads -type f -name "*.zip" -o -name "*.0*" 2>/dev/null | head -20
