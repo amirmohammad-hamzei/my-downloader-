@@ -1,55 +1,183 @@
-name: 🧪 Download Test
+name: ⬇️ Download Manager
 
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: 'لینک تست'
+      urls:
+        description: 'لینک‌های دانلود (هر خط یک لینک)'
         required: true
         type: string
-        default: 'https://httpbin.org/bytes/1024'
+      compress:
+        description: 'فشرده‌سازی به ZIP'
+        required: false
+        default: true
+        type: boolean
+      password:
+        description: 'رمز ZIP (اختیاری)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
-  test:
+  download:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        
-      - name: Test Download
-        run: |
-          echo "=== Download Test ==="
-          echo "URL: ${{ github.event.inputs.url }}"
-          echo ""
-          
-          # Test with all methods
-          echo "1. Testing curl..."
-          curl -L -o test_curl.dat "${{ github.event.inputs.url }}" -w "  Size: %{size_download} bytes\n  Time: %{time_total}s\n" 2>&1 || echo "  FAILED"
-          
-          echo "2. Testing wget..."
-          wget -O test_wget.dat "${{ github.event.inputs.url }}" 2>&1 || echo "  FAILED"
-          ls -lh test_wget.dat 2>/dev/null || echo "  No file created"
-          
-          echo "3. Testing aria2..."
-          sudo apt-get update -qq && sudo apt-get install -y -qq aria2
-          aria2c -d . -o test_aria2.dat "${{ github.event.inputs.url }}" 2>&1 || echo "  FAILED"
-          ls -lh test_aria2.dat 2>/dev/null || echo "  No file created"
-          
-          echo ""
-          echo "=== Results ==="
-          ls -lh test_*.dat 2>/dev/null || echo "No files downloaded!"
 
-      - name: Save Results
+      - name: Download Files
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+          COMPRESS: ${{ github.event.inputs.compress }}
+          PASSWORD: ${{ github.event.inputs.password }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 p7zip-full
+          
+          mkdir -p downloads
+          cd downloads
+          
+          count=0
+          success=0
+          failed=0
+          
+          echo "$URLS" | while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            count=$((count + 1))
+            
+            # Get filename
+            filename=$(basename "$url" | cut -d'?' -f1 | cut -d'#' -f1)
+            [ -z "$filename" ] && filename="file_${count}"
+            
+            echo "========================================="
+            echo "[$count] Downloading: $filename"
+            echo "URL: $url"
+            echo ""
+            
+            # Try to download with multiple tools
+            downloaded=false
+            
+            # Try aria2 first
+            if aria2c -q -x4 -s4 --max-tries=3 --timeout=60 \
+              --dir=. --out="$filename" "$url" 2>/dev/null; then
+              if [ -s "$filename" ]; then
+                downloaded=true
+                echo "Downloaded with aria2"
+              fi
+            fi
+            
+            # Try wget
+            if [ "$downloaded" = false ]; then
+              if wget -q --show-progress --tries=3 --timeout=60 \
+                -U "Mozilla/5.0" -O "$filename" "$url" 2>&1; then
+                if [ -s "$filename" ]; then
+                  downloaded=true
+                  echo "Downloaded with wget"
+                fi
+              fi
+            fi
+            
+            # Try curl
+            if [ "$downloaded" = false ]; then
+              if curl -L -# --retry 3 --connect-timeout 30 \
+                -A "Mozilla/5.0" -o "$filename" "$url" 2>&1; then
+                if [ -s "$filename" ]; then
+                  downloaded=true
+                  echo "Downloaded with curl"
+                fi
+              fi
+            fi
+            
+            if [ "$downloaded" = true ]; then
+              size=$(stat -c%s "$filename" 2>/dev/null || echo 0)
+              size_mb=$((size / 1024 / 1024))
+              echo "Size: ${size_mb} MB"
+              
+              # Compress if requested
+              if [ "$COMPRESS" = "true" ] && [ "${filename##*.}" != "zip" ]; then
+                zipname="${filename}.zip"
+                if [ -n "$PASSWORD" ]; then
+                  7z a -tzip -p"$PASSWORD" "$zipname" "$filename" > /dev/null 2>&1
+                else
+                  7z a -tzip "$zipname" "$filename" > /dev/null 2>&1
+                fi
+                
+                if [ -s "$zipname" ]; then
+                  rm "$filename"
+                  filename="$zipname"
+                  size=$(stat -c%s "$filename" 2>/dev/null || echo 0)
+                  echo "Compressed: $(($size / 1024 / 1024)) MB"
+                fi
+              fi
+              
+              # Split if > 90MB
+              if [ "$size" -gt 94371840 ]; then
+                echo "Splitting into 90MB parts..."
+                7z a -tzip -v90m "${filename}.7z" "$filename" > /dev/null 2>&1
+                if ls "${filename}.7z".* >/dev/null 2>&1; then
+                  rm "$filename"
+                  echo "Split into $(ls -1 "${filename}.7z".* 2>/dev/null | wc -l) parts"
+                fi
+              fi
+              
+              success=$((success + 1))
+              echo "OK"
+            else
+              failed=$((failed + 1))
+              echo "FAILED"
+              echo "$url" >> ../failed_urls.txt
+            fi
+            
+            echo ""
+          done
+          
+          cd ..
+          
+          echo "========================================="
+          echo "Results: $success downloaded, $failed failed"
+          echo "========================================="
+          
+          # Create report
+          echo "# Downloads" > downloads/README.md
+          echo "" >> downloads/README.md
+          echo "Date: $(date)" >> downloads/README.md
+          echo "" >> downloads/README.md
+          echo "## Files" >> downloads/README.md
+          ls -lh downloads/ >> downloads/README.md 2>/dev/null
+
+      - name: Save to Repository
         if: always()
         run: |
-          mkdir -p downloads
-          if [ -f test_curl.dat ]; then
-            cp test_curl.dat downloads/
-            echo "Download successful!" > downloads/README.md
-          fi
-          
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads/ 2>/dev/null
-          git commit -m "Test download" 2>/dev/null || true
-          git push 2>/dev/null || echo "Push skipped (no changes or permission issue)"
+          git add downloads/ failed_urls.txt 2>/dev/null || true
+          
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          
+          git commit -m "📥 Download update [skip ci]" 2>/dev/null || true
+          git pull --rebase 2>/dev/null || true
+          git push 2>/dev/null || echo "Push failed"
+          
+          echo "Files saved!"
+
+      - name: Show Results
+        if: always()
+        run: |
+          echo ""
+          echo "=============================="
+          echo " DOWNLOAD COMPLETE"
+          echo "=============================="
+          echo ""
+          if [ -d "downloads" ]; then
+            echo "Downloaded files:"
+            find downloads -type f ! -name "README.md" -exec ls -lh {} \;
+          else
+            echo "No files downloaded"
+          fi
