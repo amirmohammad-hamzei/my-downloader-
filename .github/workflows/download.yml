@@ -121,7 +121,6 @@ jobs:
             for try in $(seq 1 $MAX_RETRIES); do
               log_info "Attempt $try/$MAX_RETRIES: $fname"
               
-              # Method 1: aria2
               if timeout 600 aria2c -q --split=4 --max-connection-per-server=4 \
                 --min-split-size=20M --max-tries=2 --retry-wait=5 \
                 --timeout=60 --connect-timeout=30 --check-certificate=true \
@@ -130,14 +129,12 @@ jobs:
                 [ -s "$output" ] && { log_ok "Downloaded: $fname"; return 0; }
               fi
               
-              # Method 2: wget
               log_info "Trying wget..."
               if timeout 600 wget -q --show-progress --tries=2 --timeout=60 \
                 -U "Mozilla/5.0" -O "$output" "$url" 2>&1; then
                 [ -s "$output" ] && { log_ok "Downloaded: $fname"; return 0; }
               fi
               
-              # Method 3: curl
               log_info "Trying curl..."
               if timeout 600 curl -L -f -# --retry 2 --retry-delay 5 \
                 --connect-timeout 30 --max-time 3600 \
@@ -154,15 +151,14 @@ jobs:
           }
 
           # ═══════════════════════════════
-          # Function: Split into parts (compatible with all platforms)
-          # Creates: .part01.zip, .part02.zip, ... + merge_me.bat + merge_me.sh + README
+          # Function: Split file into parts
           # ═══════════════════════════════
           
           split_into_parts() {
-            local file_to_split="$1"      # Full path to zip file
-            local output_dir="$2"         # Where to create parts
-            local base_name="$3"          # Base name for parts
-            local split_mb="$4"           # Max size per part in MB
+            local file_to_split="$1"
+            local output_dir="$2"
+            local base_name="$3"
+            local split_mb="$4"
             
             cd "$output_dir"
             
@@ -170,15 +166,13 @@ jobs:
             local original_size=$(stat -c%s "$file_to_split" 2>/dev/null || echo 0)
             local original_size_mb=$((original_size / 1024 / 1024))
             
-            log_info "Splitting ${original_size_mb}MB file into ${split_mb}MB parts..."
+            log_info "Splitting ${original_size_mb}MB into ${split_mb}MB parts..."
             
-            # Use standard split with .partXX naming
+            # Split into parts
             split -b "${split_mb}M" -d "$original_filename" "${base_name}.part"
-            
-            # Remove the large original
             rm -f "$original_filename"
             
-            # Rename parts to .part01.zip, .part02.zip, ...
+            # Rename parts
             local part_num=1
             for part in ${base_name}.part*; do
               local ext_num=$(printf "%02d" $part_num)
@@ -188,63 +182,51 @@ jobs:
             
             local total_parts=$((part_num - 1))
             
-            # ═══════════════════════════════
-            # Create merge script for Windows (.bat)
-            # ═══════════════════════════════
+            # Create Windows batch file
+            {
+              echo "@echo off"
+              echo "title Join ZIP Parts - ${base_name}"
+              echo "echo."
+              echo "echo ========================================="
+              echo "echo   Joining ${total_parts} parts into ${base_name}.zip"
+              echo "echo ========================================="
+              echo "echo."
+              printf "copy /b \"${base_name}.part01.zip\""
+              for i in $(seq 2 $total_parts); do
+                printf " + \"${base_name}.part%02d.zip\"" $i
+              done
+              echo " \"${base_name}.zip\""
+              echo "if exist \"${base_name}.zip\" ("
+              echo "  echo."
+              echo "  echo SUCCESS! Created: ${base_name}.zip"
+              echo "  echo Now extract with 7-Zip or WinRAR"
+              echo ") else ("
+              echo "  echo."
+              echo "  echo FAILED! Make sure all parts are in this folder"
+              echo ")"
+              echo "pause"
+            } > "JOIN_PARTS.bat"
             
-            cat > "JOIN_PARTS.bat" << BATEOF
-          @echo off
-          title Join ZIP Parts - ${base_name}
-          echo.
-          echo ═══════════════════════════════════════
-          echo   Joining ${total_parts} parts into ${base_name}.zip
-          echo ═══════════════════════════════════════
-          echo.
-          
-          copy /b "${base_name}.part01.zip" + "${base_name}.part02.zip"$(
-            for i in $(seq 3 $total_parts); do
-              printf " + \"${base_name}.part%02d.zip\"" $i
-            done
-          ) "${base_name}.zip"
-          
-          if exist "${base_name}.zip" (
-            echo.
-            echo ✅ Success! Created: ${base_name}.zip
-            echo.
-            echo Now extract ${base_name}.zip with 7-Zip or WinRAR
-            pause
-          ) else (
-            echo.
-            echo ❌ Failed! Make sure all parts are in this folder
-            pause
-          )
-          BATEOF
-            
-            # ═══════════════════════════════
-            # Create merge script for Linux/Mac (.sh)
-            # ═══════════════════════════════
-            
-            cat > "join_parts.sh" << SHEOF
-          #!/bin/bash
-          # Join split ZIP parts - ${base_name}
-          
-          echo "═══════════════════════════════════════"
-          echo "  Joining ${total_parts} parts into ${base_name}.zip"
-          echo "═══════════════════════════════════════"
-          echo ""
-          
-          cat ${base_name}.part??.zip > "${base_name}.zip"
-          
-          if [ -f "${base_name}.zip" ]; then
-            echo "✅ Success! Created: ${base_name}.zip"
-            echo ""
-            echo "Now extract with:"
-            echo "  unzip ${base_name}.zip"
-            [ -n "$PASSWORD" ] && echo "  (password required)"
-          else
-            echo "❌ Failed! Make sure all parts are in this folder"
-          fi
-          SHEEOF
+            # Create Linux/Mac script
+            {
+              echo "#!/bin/bash"
+              echo "echo '========================================'"
+              echo "echo '  Joining ${total_parts} parts into ${base_name}.zip'"
+              echo "echo '========================================'"
+              echo "echo"
+              echo "cat ${base_name}.part??.zip > \"${base_name}.zip\""
+              echo "if [ -f \"${base_name}.zip\" ]; then"
+              echo "  echo 'SUCCESS! Created: ${base_name}.zip'"
+              echo "  echo"
+              echo "  echo 'Now extract with:'"
+              echo "  echo '  unzip ${base_name}.zip'"
+              if [ -n "$PASSWORD" ]; then
+                echo "  echo '  (password required)'"
+              fi
+              echo "else"
+              echo "  echo 'FAILED! Make sure all parts are in this folder'"
+              echo "fi"
+            } > "join_parts.sh"
             
             chmod +x join_parts.sh
             
@@ -259,7 +241,6 @@ jobs:
           process_file() {
             local url="$1"
             
-            # Get filename from URL
             local original_name=$(basename "$url" | sed 's/%20/ /g' | sed 's/[?#].*//')
             local safe_name=$(sanitize "$original_name")
             local temp_file="tmp_downloads/${safe_name}"
@@ -272,23 +253,22 @@ jobs:
             
             # Download
             if ! download_file "$url" "$temp_file"; then
-              # Create error report
               local err_dir="downloads/failed/${base_name}_$(date +%s)"
               mkdir -p "$err_dir"
-              cat > "$err_dir/README.md" << EOF
-          # ❌ Download Failed
-          
-          | Info | Value |
-          |------|-------|
-          | File | $safe_name |
-          | URL | $url |
-          | Date | $(date) |
-          
-          ## Possible Fixes
-          1. Check URL in browser
-          2. Try again later
-          3. Some servers block bots
-          EOF
+              {
+                echo "# ❌ Download Failed"
+                echo ""
+                echo "| Info | Value |"
+                echo "|------|-------|"
+                echo "| File | $safe_name |"
+                echo "| URL | $url |"
+                echo "| Date | $(date) |"
+                echo ""
+                echo "## Possible Fixes"
+                echo "1. Check URL in browser"
+                echo "2. Try again later"
+                echo "3. Some servers block bots"
+              } > "$err_dir/README.md"
               return 1
             fi
             
@@ -296,15 +276,13 @@ jobs:
             local size=$(stat -c%s "$temp_file" 2>/dev/null || echo 0)
             local size_mb=$((size / 1024 / 1024))
             
-            # Create output directory
             mkdir -p "$output_dir"
             
-            # Move file to output directory for processing
             local working_file="$output_dir/${safe_name}"
             mv "$temp_file" "$working_file"
             
             # ═══════════════════
-            # Step 1: Decide compression
+            # Step 1: Compression
             # ═══════════════════
             
             local current_file="$safe_name"
@@ -314,7 +292,6 @@ jobs:
             cd "$output_dir"
             
             if need_compress "$safe_name" "$COMPRESSION"; then
-              # Compress to ZIP
               log_info "Compressing to ZIP (${size_mb}MB)..."
               
               local zip_name="${safe_name}.zip"
@@ -338,20 +315,19 @@ jobs:
             
             cd - > /dev/null
             
-            # Get final size
             local final_size=$(stat -c%s "$output_dir/$current_file" 2>/dev/null || echo 0)
             local final_size_mb=$((final_size / 1024 / 1024))
             
             # ═══════════════════
-            # Step 2: Check if needs splitting
+            # Step 2: Split if needed
             # ═══════════════════
             
             if [ "$final_size" -gt "$SPLIT_BYTES" ]; then
-              log_info "File is ${final_size_mb}MB - splitting into ${SPLIT_MB}MB parts..."
+              log_info "File is ${final_size_mb}MB - splitting..."
               
-              # If not already a ZIP, wrap it first
+              # Wrap in ZIP if not already
               if [ "$is_zipped" = false ]; then
-                log_info "Wrapping in ZIP before splitting..."
+                log_info "Wrapping in ZIP..."
                 
                 cd "$output_dir"
                 
@@ -368,146 +344,101 @@ jobs:
                 current_path="$output_dir/$current_file"
                 
                 cd - > /dev/null
-                
-                log_ok "Wrapped in ZIP: $wrap_zip"
               fi
               
-              # Split into parts
+              # Split
               local split_info=$(split_into_parts "$current_path" "$output_dir" "$base_name" "$SPLIT_MB")
               local part_count=$(echo "$split_info" | cut -d'|' -f1)
               local split_base=$(echo "$split_info" | cut -d'|' -f2)
               
-              # ═══════════════════
-              # Create README with mobile instructions
-              # ═══════════════════
-              
-              cat > "$output_dir/README.md" << EOF
-          # 📦 Split ZIP: $safe_name
-          
-          > ⚠️ Split into ${part_count} parts (total: ${final_size_mb}MB)
-          > 📱 **Works on ALL devices**: Windows, Mac, Linux, Android, iOS
-          
-          | Info | Value |
-          |------|-------|
-          | Original | $safe_name |
-          | Total Size | ${final_size_mb} MB |
-          | Parts | ${part_count} |
-          | Password | $([ -n "$PASSWORD" ] && echo "YES 🔐" || echo "NO") |
-          
-          ## 📁 Files in this folder
-          EOF
-              
-              # List all parts
-              for part in "$output_dir"/${split_base}.part*.zip; do
-                [ -f "$part" ] || continue
-                local pname=$(basename "$part")
-                local psize=$(ls -lh "$part" 2>/dev/null | awk '{print $5}')
-                echo "- \`$pname\` ($psize)" >> "$output_dir/README.md"
-              done
-              
-              echo "- \`JOIN_PARTS.bat\` (Windows merge script)" >> "$output_dir/README.md"
-              echo "- \`join_parts.sh\` (Mac/Linux merge script)" >> "$output_dir/README.md"
-              
-              cat >> "$output_dir/README.md" << 'EOF'
-          
-          ---
-          
-          ## 🖥️ Windows
-          ### روش ۱ (آسان)
-          ۱. همه فایل‌ها را در یک پوشه بریزید
-          ۲. روی **`JOIN_PARTS.bat`** دابل‌کلیک کنید
-          ۳. فایل ZIP نهایی ساخته می‌شود → با 7-Zip یا WinRAR استخراج کنید
-          
-          ### روش ۲ (دستی)
-          ```cmd
-          copy /b *.part*.zip combined.zip
-          ```
-          
-          ## 🐧 Linux / 🍎 Mac
-          ### روش ۱ (آسان)
-          ```bash
-          chmod +x join_parts.sh
-          ./join_parts.sh
-          ```
-          
-          ### روش ۲ (دستی)
-          ```bash
-          cat *.part*.zip > combined.zip
-          unzip combined.zip
-          ```
-          
-          ## 📱 Android
-          ### استفاده از اپلیکیشن (پیشنهادی)
-          ۱. همه فایل‌های `.part*.zip` را دانلود کنید
-          ۲. اپلیکیشن **[File Joiner](https://play.google.com/store/search?q=file+joiner&c=apps)** یا **[Split File Joiner](https://play.google.com/store/search?q=split+file+joiner&c=apps)** را نصب کنید
-          ۳. با اپ فایل‌ها را Join کنید
-          ۴. سپس با **ZArchiver** یا **RAR** استخراج کنید
-          
-          ### استفاده از Termux (پیشرفته)
-          ```bash
-          pkg install zip unzip
-          cat *.part*.zip > combined.zip
-          unzip combined.zip
-          ```
-          
-          ## 📱 iOS (iPhone/iPad)
-          ۱. همه فایل‌ها را در **Files app** دانلود کنید (در یک پوشه)
-          ۲. اپلیکیشن **[Zip & RAR File Extractor](https://apps.apple.com/us/app/zip-rar-file-extractor/id123456)** یا **iZip** را نصب کنید
-          ۳. در اپ، گزینه **Merge/Join files** را پیدا کنید
-          ۴. یا فایل‌ها را به کامپیوتر منتقل کرده و با روش ویندوز/مک join کنید
-          
-          ---
-          
-          ## ⚠️ نکات مهم
-          - ✅ **همه فایل‌ها باید در یک پوشه باشند**
-          - ✅ فایل‌ها را **rename نکنید**
-          - ✅ ترتیب فایل‌ها مهم است: `part01`, `part02`, ...
-          - ✅ بعد از join، فایل `combined.zip` را با هر برنامه ZIP باز کنید
-          EOF
-              
-              if [ -n "$PASSWORD" ]; then
-                echo "" >> "$output_dir/README.md"
-                echo "> 🔐 **پسورد:** همان رمزی که موقع دانلود تنظیم کردید" >> "$output_dir/README.md"
-              fi
+              # Create README
+              {
+                echo "# 📦 Split ZIP: $safe_name"
+                echo ""
+                echo "> Split into ${part_count} parts (total: ${final_size_mb}MB)"
+                echo "> 📱 Works on ALL devices"
+                echo ""
+                echo "| Info | Value |"
+                echo "|------|-------|"
+                echo "| Original | $safe_name |"
+                echo "| Total Size | ${final_size_mb} MB |"
+                echo "| Parts | ${part_count} |"
+                echo "| Password | $([ -n "$PASSWORD" ] && echo "YES 🔐" || echo "NO") |"
+                echo ""
+                echo "## 📁 Files"
+                echo ""
+                
+                for part in "$output_dir"/${split_base}.part*.zip; do
+                  [ -f "$part" ] || continue
+                  local pname=$(basename "$part")
+                  local psize=$(ls -lh "$part" 2>/dev/null | awk '{print $5}')
+                  echo "- \`$pname\` ($psize)"
+                done
+                
+                echo "- \`JOIN_PARTS.bat\` (Windows)"
+                echo "- \`join_parts.sh\` (Mac/Linux)"
+                echo ""
+                echo "---"
+                echo ""
+                echo "## 🖥️ Windows"
+                echo "1. Put ALL files in one folder"
+                echo "2. Double-click **JOIN_PARTS.bat**"
+                echo "3. Extract the ZIP with 7-Zip or WinRAR"
+                echo ""
+                echo "## 🐧 Linux / 🍎 Mac"
+                echo '```bash'
+                echo "chmod +x join_parts.sh && ./join_parts.sh"
+                echo "unzip ${base_name}.zip"
+                echo '```'
+                echo ""
+                echo "## 📱 Android"
+                echo "1. Download all parts"
+                echo "2. Install **File Joiner** app"
+                echo "3. Join files, then extract with **ZArchiver**"
+                echo ""
+                echo "## 📱 iOS"
+                echo "Transfer to computer and use Windows/Mac method"
+                echo ""
+                echo "## ⚠️ Important"
+                echo "- ALL parts must be in the same folder"
+                echo "- Do NOT rename the files"
+                echo "- Parts order: part01, part02, part03, ..."
+                
+                if [ -n "$PASSWORD" ]; then
+                  echo ""
+                  echo "> 🔐 Password: The one you set when downloading"
+                fi
+              } > "$output_dir/README.md"
               
               log_ok "Split complete: ${part_count} parts"
               
             else
-              # ═══════════════════
-              # No split needed - simple README
-              # ═══════════════════
-              
-              cat > "$output_dir/README.md" << EOF
-          # 📦 File: $safe_name
-          
-          | Info | Value |
-          |------|-------|
-          | File | $current_file |
-          | Size | ${final_size_mb} MB |
-          | Type | $([ "$is_zipped" = true ] && echo "ZIP Archive" || echo "Original File") |
-          | Password | $([ -n "$PASSWORD" ] && echo "YES 🔐" || echo "NO") |
-          
-          ## 📱 How to Extract
-          
-          ### 🖥️ Windows
-          - Right-click → **7-Zip** → Extract Here
-          - Or use **WinRAR**
-          
-          ### 🍎 Mac
-          - Double-click to extract
-          
-          ### 🐧 Linux
-          ```bash
-          unzip $current_file
-          ```
-          
-          ### 📱 Android
-          - Use **ZArchiver** or **RAR** app
-          
-          ### 📱 iOS
-          - Use **iZip** or **Unzip** app
-          $([ -n "$PASSWORD" ] && echo "\n> 🔐 **Password:** The one you set when downloading" || echo "")
-          EOF
+              # No split needed
+              {
+                echo "# 📦 File: $safe_name"
+                echo ""
+                echo "| Info | Value |"
+                echo "|------|-------|"
+                echo "| File | $current_file |"
+                echo "| Size | ${final_size_mb} MB |"
+                echo "| Type | $([ "$is_zipped" = true ] && echo "ZIP Archive" || echo "Original File") |"
+                echo "| Password | $([ -n "$PASSWORD" ] && echo "YES 🔐" || echo "NO") |"
+                echo ""
+                echo "## 📱 Extract on..."
+                echo ""
+                echo "| Platform | Method |"
+                echo "|----------|--------|"
+                echo "| Windows | 7-Zip or WinRAR |"
+                echo "| Mac | Double-click |"
+                echo "| Linux | \`unzip $current_file\` |"
+                echo "| Android | ZArchiver app |"
+                echo "| iOS | iZip app |"
+                
+                if [ -n "$PASSWORD" ]; then
+                  echo ""
+                  echo "> 🔐 Password: The one you set when downloading"
+                fi
+              } > "$output_dir/README.md"
               
               log_ok "File is ${final_size_mb}MB - no split needed"
             fi
@@ -550,7 +481,6 @@ jobs:
             batch_dir="downloads/complete/$batch_name"
             mkdir -p "$batch_dir"
             
-            # Move all files to batch directory
             for dir in $all_output_dirs; do
               [ ! -d "$dir" ] && continue
               find "$dir" -type f -exec mv {} "$batch_dir/" \; 2>/dev/null
@@ -560,22 +490,19 @@ jobs:
             log_ok "Batch created: $batch_name"
           fi
           
-          # Cleanup temp
+          # Cleanup
           rm -rf tmp_downloads
           
-          # ═══════════════════
-          # Final Summary
-          # ═══════════════════
-          
+          # Summary
           echo ""
           echo "════════════════════════════════════════"
           echo "   ✅ Success: $success  |  ❌ Failed: $fail"
           echo "════════════════════════════════════════"
-          
-          # List files
           echo ""
           echo "📁 Downloaded files:"
-          find downloads/complete -type f ! -name "README.md" ! -name "*.bat" ! -name "*.sh" -exec ls -lh {} \; 2>/dev/null || echo "  (none)"
+          find downloads/complete -type f -name "*.zip" -o -name "*.part*.zip" | while read f; do
+            ls -lh "$f" 2>/dev/null
+          done
           
           if [ $fail -gt 0 ]; then
             echo ""
@@ -585,99 +512,85 @@ jobs:
       - name: 📊 Create Report in downloads folder
         if: always()
         run: |
-          echo "📊 Creating report in downloads/ folder..."
+          echo "📊 Creating report..."
           
           REPO_URL="${{ github.server_url }}/${{ github.repository }}"
           BRANCH="${{ github.ref_name }}"
           
-          # Create report
-          cat > downloads/README.md << 'EOF'
-          # 📥 فایل‌های دانلود شده
-          
-          > آخرین به‌روزرسانی: 
-          EOF
-          
-          echo "> $(date '+%Y-%m-%d %H:%M:%S')" >> downloads/README.md
-          echo "> 📱 **قابل استفاده روی همه دستگاه‌ها**" >> downloads/README.md
-          echo "" >> downloads/README.md
-          echo "---" >> downloads/README.md
-          
-          # Successful downloads
-          if [ -d "downloads/complete" ] && [ "$(ls -A downloads/complete 2>/dev/null)" ]; then
-            echo "" >> downloads/README.md
-            echo "## ✅ دانلودهای موفق" >> downloads/README.md
-            echo "" >> downloads/README.md
-            echo "| 📁 پوشه | 📏 حجم | 📦 فایل‌ها | 🔗 لینک |" >> downloads/README.md
-            echo "|---------|-------|-----------|--------|" >> downloads/README.md
+          {
+            echo "# 📥 Downloaded Files"
+            echo ""
+            echo "> Last update: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "> 📱 Compatible with all devices"
+            echo ""
+            echo "---"
             
-            for dir in downloads/complete/*/; do
-              [ -d "$dir" ] || continue
-              dname=$(basename "$dir")
-              dsize=$(du -sh "$dir" 2>/dev/null | cut -f1)
-              fcount=$(find "$dir" -type f ! -name "README.md" ! -name "*.bat" ! -name "*.sh" 2>/dev/null | wc -l)
-              denc=$(echo "$dname" | sed 's/ /%20/g')
-              dlink="${REPO_URL}/tree/${BRANCH}/downloads/complete/${denc}"
+            if [ -d "downloads/complete" ] && [ "$(ls -A downloads/complete 2>/dev/null)" ]; then
+              echo ""
+              echo "## ✅ Successful Downloads"
+              echo ""
+              echo "| Folder | Size | Files | Link |"
+              echo "|--------|------|-------|------|"
               
-              echo "| [${dname}](${dlink}) | ${dsize} | ${fcount} | [📂 باز کردن](${dlink}) |" >> downloads/README.md
-            done
-          else
-            echo "" >> downloads/README.md
-            echo "_هنوز فایلی دانلود نشده_" >> downloads/README.md
-          fi
+              for dir in downloads/complete/*/; do
+                [ -d "$dir" ] || continue
+                dname=$(basename "$dir")
+                dsize=$(du -sh "$dir" 2>/dev/null | cut -f1)
+                fcount=$(find "$dir" -type f ! -name "README.md" ! -name "*.bat" ! -name "*.sh" 2>/dev/null | wc -l)
+                denc=$(echo "$dname" | sed 's/ /%20/g')
+                dlink="${REPO_URL}/tree/${BRANCH}/downloads/complete/${denc}"
+                echo "| [${dname}](${dlink}) | ${dsize} | ${fcount} | [Open](${dlink}) |"
+              done
+            else
+              echo ""
+              echo "_No files downloaded yet_"
+            fi
+            
+            if [ -d "downloads/failed" ] && [ "$(ls -A downloads/failed 2>/dev/null)" ]; then
+              echo ""
+              echo "## ❌ Failed Downloads"
+              echo ""
+              for dir in downloads/failed/*/; do
+                [ -d "$dir" ] || continue
+                dname=$(basename "$dir")
+                denc=$(echo "$dname" | sed 's/ /%20/g')
+                dlink="${REPO_URL}/tree/${BRANCH}/downloads/failed/${denc}"
+                echo "- [${dname}](${dlink})"
+              done
+            fi
+            
+            echo ""
+            echo "---"
+            echo ""
+            echo "### 📱 How to join split files"
+            echo ""
+            echo "| Platform | Method |"
+            echo "|----------|--------|"
+            echo "| Windows | Double-click JOIN_PARTS.bat |"
+            echo "| Mac/Linux | Run: ./join_parts.sh |"
+            echo "| Android | File Joiner app + ZArchiver |"
+            echo "| iOS | Transfer to PC/Mac first |"
+            echo ""
+            echo "**⚠️ All parts must be in the same folder!**"
+          } > downloads/README.md
           
-          # Failed downloads
-          if [ -d "downloads/failed" ] && [ "$(ls -A downloads/failed 2>/dev/null)" ]; then
-            echo "" >> downloads/README.md
-            echo "## ❌ دانلودهای ناموفق" >> downloads/README.md
-            echo "" >> downloads/README.md
-            for dir in downloads/failed/*/; do
-              [ -d "$dir" ] || continue
-              dname=$(basename "$dir")
-              denc=$(echo "$dname" | sed 's/ /%20/g')
-              dlink="${REPO_URL}/tree/${BRANCH}/downloads/failed/${denc}"
-              echo "- [${dname}](${dlink})" >> downloads/README.md
-            done
-          fi
-          
-          # Help section
-          cat >> downloads/README.md << 'EOF'
-          
-          ---
-          
-          ### 📱 راهنمای استخراج فایل‌های چندبخشی
-          
-          فایل‌های split شده با پسوند `.part01.zip`، `.part02.zip` و...:
-          
-          | سیستم‌عامل | روش Join کردن |
-          |-----------|------------|
-          | **Windows** | روی `JOIN_PARTS.bat` دابل‌کلیک کنید |
-          | **Mac/Linux** | `chmod +x join_parts.sh && ./join_parts.sh` |
-          | **Android** | اپلیکیشن File Joiner + ZArchiver |
-          | **iOS** | به کامپیوتر منتقل کنید یا از اپ Zip Extractor استفاده کنید |
-          
-          **⚠️ نکته مهم:** همه فایل‌ها باید در **یک پوشه** باشند!
-          EOF
-          
-          echo "✅ Report created in downloads/README.md"
+          echo "✅ Report created"
 
       - name: 💾 Commit and Push
         if: always()
         run: |
-          echo "💾 Saving files to repository..."
+          echo "💾 Saving files..."
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Stage only downloads folder
           git add downloads/ 2>/dev/null || true
           
-          # Check if there's anything to commit
           if git diff --cached --quiet 2>/dev/null; then
             echo "No changes to commit"
             exit 0
           fi
           
-          # Commit with descriptive message
           success_count=$(find downloads/complete -type f ! -name "README.md" ! -name "*.bat" ! -name "*.sh" 2>/dev/null | wc -l)
           fail_count=$(find downloads/failed -mindepth 1 -type d 2>/dev/null | wc -l)
           
@@ -687,15 +600,14 @@ jobs:
           
           git commit -m "$commit_msg" || echo "Nothing to commit"
           
-          # Push with retry
           for i in 1 2 3; do
             git pull --rebase origin "${{ github.ref_name }}" 2>/dev/null && break
             sleep 5
           done
           
-          git push origin HEAD:"${{ github.ref_name }}" || echo "Push failed, will retry..."
+          git push origin HEAD:"${{ github.ref_name }}" || echo "Push will retry next run"
           
-          echo "✅ Files saved to repository"
+          echo "✅ Saved"
 
       - name: 🎉 Done
         if: always()
@@ -705,12 +617,5 @@ jobs:
           echo "   🎉 Session Complete!"
           echo "════════════════════════════════════════"
           echo ""
-          echo "📁 All files saved in: downloads/"
-          echo "📊 Full report: downloads/README.md"
-          echo ""
-          echo "📱 Compatible with:"
-          echo "   🖥️  Windows  (run JOIN_PARTS.bat)"
-          echo "   🍎 Mac      (run join_parts.sh)"
-          echo "   🐧 Linux    (run join_parts.sh)"
-          echo "   📱 Android  (File Joiner app)"
-          echo "   📱 iOS      (transfer to computer)"
+          echo "📁 Files saved in: downloads/"
+          echo "📊 Report: downloads/README.md"
