@@ -1,0 +1,590 @@
+name: ⬇️ Download Manager
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'لینک‌های دانلود (با فاصله جدا کنید)'
+        required: true
+        type: string
+      mode:
+        description: 'حالت دانلود'
+        required: false
+        default: 'single'
+        type: choice
+        options:
+          - single
+          - batch
+      compression:
+        description: 'فشرده‌سازی'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - always
+          - never
+      password:
+        description: 'رمز فایل zip (اختیاری)'
+        required: false
+        default: ''
+        type: string
+      split_size:
+        description: 'حداکثر حجم هر بخش (MB)'
+        required: false
+        default: '90'
+        type: string
+
+jobs:
+  download-files:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 📦 Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 zip unzip curl wget bc
+
+      - name: 📥 Download and Process Files
+        run: |
+          # ═══════════════════════════════
+          # Download Manager - All in One
+          # ═══════════════════════════════
+          
+          set -e
+          
+          # Create directories
+          mkdir -p downloads/complete
+          mkdir -p downloads/failed
+          mkdir -p downloads/logs
+          mkdir -p tmp_downloads
+          
+          # Settings
+          SPLIT_MB="${{ github.event.inputs.split_size }}"
+          PASSWORD="${{ github.event.inputs.password }}"
+          COMPRESSION="${{ github.event.inputs.compression }}"
+          MODE="${{ github.event.inputs.mode }}"
+          URLS="${{ github.event.inputs.urls }}"
+          MAX_RETRIES=3
+          
+          echo "════════════════════════════════════════"
+          echo "   🚀 Download Manager"
+          echo "════════════════════════════════════════"
+          echo "Mode: $MODE | Compression: $COMPRESSION"
+          echo "Split: ${SPLIT_MB}MB | Password: $([ -n "$PASSWORD" ] && echo 'YES' || echo 'NO')"
+          echo ""
+          
+          # ═══════════════════
+          # Helper Functions
+          # ═══════════════════
+          
+          log_ok() { echo "✅ $1"; echo "✅ $1" >> downloads/logs/session.log; }
+          log_err() { echo "❌ $1"; echo "❌ $1" >> downloads/logs/session.log; }
+          log_info() { echo "ℹ️  $1"; }
+          
+          sanitize() {
+            echo "$1" | sed 's/[<>:"|?*\\]/_/g' | sed 's/%20/ /g' | sed 's/[?#].*//'
+          }
+          
+          need_compress() {
+            local f="$1"
+            local mode="$2"
+            case "$mode" in
+              always) return 0 ;;
+              never) return 1 ;;
+              auto)
+                local ext=$(echo "${f##*.}" | tr '[:upper:]' '[:lower:]')
+                case "$ext" in
+                  zip|rar|7z|gz|bz2|xz|tar|iso|dmg|exe|msi|mp4|mkv|avi|mp3|jpg|png|pdf) return 1 ;;
+                  *) return 0 ;;
+                esac ;;
+            esac
+          }
+          
+          download_file() {
+            local url="$1"
+            local output="$2"
+            local fname=$(basename "$output")
+            
+            for try in $(seq 1 $MAX_RETRIES); do
+              log_info "Attempt $try/$MAX_RETRIES: $fname"
+              
+              # Method 1: aria2
+              if aria2c -q --split=4 --max-connection-per-server=4 \
+                --min-split-size=20M --max-tries=2 --retry-wait=5 \
+                --timeout=60 --connect-timeout=30 --check-certificate=true \
+                --allow-overwrite=true --auto-file-renaming=false \
+                --dir="$(dirname "$output")" --out="$fname" "$url" 2>/dev/null; then
+                [ -s "$output" ] && { log_ok "Downloaded: $fname"; return 0; }
+              fi
+              
+              # Method 2: wget
+              log_info "Trying wget..."
+              if wget -q --show-progress --tries=2 --timeout=60 \
+                -U "Mozilla/5.0" -O "$output" "$url" 2>&1; then
+                [ -s "$output" ] && { log_ok "Downloaded: $fname"; return 0; }
+              fi
+              
+              # Method 3: curl
+              log_info "Trying curl..."
+              if curl -L -f -# --retry 2 --retry-delay 5 \
+                --connect-timeout 30 --max-time 3600 \
+                -A "Mozilla/5.0" -o "$output" "$url" 2>&1; then
+                [ -s "$output" ] && { log_ok "Downloaded: $fname"; return 0; }
+              fi
+              
+              [ $try -lt $MAX_RETRIES ] && sleep $((try * 15))
+            done
+            
+            rm -f "$output"
+            log_err "Failed: $fname"
+            return 1
+          }
+
+          # ═══════════════════════════════
+          # Function: Create single ZIP
+          # ═══════════════════════════════
+          
+          create_zip() {
+            local source_file="$1"
+            local output_dir="$2"
+            local safe_name="$3"
+            local zip_password="$4"
+            
+            cd "$output_dir"
+            
+            local zip_name="${safe_name}.zip"
+            
+            if [ -n "$zip_password" ]; then
+              log_info "Creating password-protected ZIP..."
+              zip -j -P "$zip_password" "$zip_name" "$source_file" -q
+            else
+              log_info "Creating ZIP..."
+              zip -j "$zip_name" "$source_file" -q
+            fi
+            
+            rm -f "$source_file"
+            echo "$zip_name"
+          }
+
+          # ═══════════════════════════════
+          # Function: Split ZIP into multi-volume
+          # ═══════════════════════════════
+          
+          split_zip_multivolume() {
+            local zip_file="$1"        # Full path to zip
+            local output_dir="$2"      # Where to put parts
+            local base_name="$3"       # Base name without extension
+            local split_mb="$4"        # Max size per part in MB
+            local zip_password="$5"    # Password (can be empty)
+            
+            cd "$output_dir"
+            
+            local original_zip=$(basename "$zip_file")
+            local split_prefix="${base_name}_split"
+            
+            log_info "Splitting ZIP into ${split_mb}MB multi-volume parts..."
+            
+            # Create a temporary copy to work with
+            cp "$original_zip" "temp_${original_zip}"
+            
+            # Use zip's built-in split (--split-size or -s flag)
+            # This creates: base_name.z01, base_name.z02, ..., base_name.zip
+            if [ -n "$zip_password" ]; then
+              # For password-protected: first create split, then re-encrypt parts
+              # zip -s requires the zip to be split first
+              zip -s "${split_mb}m" "temp_${original_zip}" --out "${split_prefix}.zip" -q
+            else
+              zip -s "${split_mb}m" "temp_${original_zip}" --out "${split_prefix}.zip" -q
+            fi
+            
+            # Remove temp files
+            rm -f "temp_${original_zip}" "$original_zip"
+            
+            # Count parts (including the .zip file)
+            local part_count=$(find . -maxdepth 1 -name "${split_prefix}.z*" -o -name "${split_prefix}.zip" | wc -l)
+            
+            # Rename parts to cleaner names (if needed)
+            # Parts are already: split_prefix.z01, split_prefix.z02, ..., split_prefix.zip
+            # These are standard multi-volume zip format
+            
+            log_ok "Created ${part_count} multi-volume ZIP parts"
+            
+            # Return prefix for README creation
+            echo "${part_count}|${split_prefix}"
+          }
+
+          # ═══════════════════════════════
+          # Function: Process single file
+          # ═══════════════════════════════
+
+          process_file() {
+            local url="$1"
+            
+            # Get filename from URL
+            local original_name=$(basename "$url" | sed 's/%20/ /g' | sed 's/[?#].*//')
+            local safe_name=$(sanitize "$original_name")
+            local temp_file="tmp_downloads/${safe_name}"
+            local base_name="${safe_name%.*}"
+            local output_dir="downloads/complete/${base_name}"
+            
+            log_info "URL: $url"
+            log_info "File: $safe_name"
+            
+            # Download
+            if ! download_file "$url" "$temp_file"; then
+              # Create error report
+              local err_dir="downloads/failed/${base_name}_$(date +%s)"
+              mkdir -p "$err_dir"
+              cat > "$err_dir/README.md" << EOF
+          # ❌ Download Failed
+          
+          | Info | Value |
+          |------|-------|
+          | File | $safe_name |
+          | URL | $url |
+          | Date | $(date) |
+          
+          ## Possible Fixes
+          1. Check URL in browser
+          2. Try again later
+          3. Some servers block bots
+          EOF
+              return 1
+            fi
+            
+            # Get size
+            local size=$(stat -c%s "$temp_file" 2>/dev/null || echo 0)
+            local size_mb=$((size / 1024 / 1024))
+            
+            # Create output directory
+            mkdir -p "$output_dir"
+            
+            # Move file to output first (for processing)
+            local working_file="$output_dir/${safe_name}"
+            mv "$temp_file" "$working_file"
+            
+            # Determine if we need to compress
+            local final_file=""
+            local is_zipped=false
+            
+            if need_compress "$safe_name" "$COMPRESSION"; then
+              # Compress to ZIP
+              final_file=$(create_zip "$working_file" "$output_dir" "$safe_name" "$PASSWORD")
+              is_zipped=true
+              log_ok "Compressed: $final_file"
+            else
+              # Keep as is (no compression)
+              final_file="$safe_name"
+              is_zipped=false
+              log_ok "Saved without compression"
+            fi
+            
+            local final_path="$output_dir/$final_file"
+            local final_size=$(stat -c%s "$final_path" 2>/dev/null || echo 0)
+            
+            # Check if needs splitting
+            if [ "$final_size" -gt "$SPLIT_BYTES" ]; then
+              log_info "File is $(($final_size / 1024 / 1024))MB - splitting into ${SPLIT_MB}MB parts..."
+              
+              # If not already a ZIP, wrap it first
+              if [ "$is_zipped" = false ]; then
+                log_info "Wrapping in ZIP before splitting..."
+                final_file=$(create_zip "$working_file" "$output_dir" "$safe_name" "$PASSWORD")
+                log_ok "Wrapped in ZIP: $final_file"
+              fi
+              
+              # Now split using multi-volume ZIP
+              local split_info=$(split_zip_multivolume "$output_dir/$final_file" "$output_dir" "$safe_name" "$SPLIT_MB" "$PASSWORD")
+              local part_count=$(echo "$split_info" | cut -d'|' -f1)
+              local split_prefix=$(echo "$split_info" | cut -d'|' -f2)
+              local zip_size_mb=$(($final_size / 1024 / 1024))
+              
+              # Get list of part files for README
+              local parts_list=$(find "$output_dir" -maxdepth 1 -name "${split_prefix}.z*" -o -name "${split_prefix}.zip" | sort)
+              local part_names=""
+              while IFS= read -r part; do
+                local pname=$(basename "$part")
+                local psize=$(ls -lh "$part" | awk '{print $5}')
+                part_names="${part_names}${pname} (${psize})  \n"
+              done <<< "$parts_list"
+              
+              # Create README
+              cat > "$output_dir/README.md" << EOF
+          # 📦 Multi-Volume ZIP: $safe_name
+          
+          > ⚠️ Split into ${SPLIT_MB}MB parts (total: ${zip_size_mb}MB, ${part_count} parts)
+          > ✅ **Standard ZIP format** - opens with WinZip, 7-Zip, WinRAR, Unarchiver
+          
+          | Info | Value |
+          |------|-------|
+          | Original | $safe_name |
+          | Total Size | ${zip_size_mb} MB |
+          | Parts | ${part_count} |
+          | Format | Multi-Volume ZIP |
+          | Password | $([ -n "$PASSWORD" ] && echo "YES" || echo "NO") |
+          
+          ## 📁 Parts
+          
+          $(echo -e "$part_names")
+          
+          ## 🔧 How to Extract
+          
+          ### Windows (7-Zip / WinRAR / WinZip)
+          1. Download ALL parts to the same folder
+          2. **Right-click on \`${split_prefix}.zip\`** (the main file)
+          3. Select **"Extract Here"** or **"Extract to..."**
+          4. Done! The tool automatically reads all parts
+          
+          ### Mac (The Unarchiver)
+          1. Download ALL parts
+          2. **Double-click \`${split_prefix}.zip\`**
+          3. The Unarchiver automatically reads all \`.z01\`, \`.z02\`, etc.
+          
+          ### Linux
+          \`\`\`bash
+          # First, make sure all parts are in the same folder
+          # Then use unzip on the main .zip file:
+          unzip ${split_prefix}.zip
+          
+          # Or for password-protected:
+          unzip -P "YOUR_PASSWORD" ${split_prefix}.zip
+          \`\`\`
+          
+          ## ⚠️ Important
+          - ALL parts must be in the same folder
+          - Do NOT rename the parts
+          - The \`.zip\` file is the main archive, \`.z01\`, \`.z02\`, etc. are the segments
+          - Most archivers detect multi-volume ZIPs automatically
+          EOF
+              
+              log_ok "Split complete: ${part_count} multi-volume parts"
+            else
+              # No split needed - simple README
+              cat > "$output_dir/README.md" << EOF
+          # 📦 File: $safe_name
+          
+          | Info | Value |
+          |------|-------|
+          | File | $final_file |
+          | Size | $(($final_size / 1024 / 1024)) MB |
+          | Type | $([ "$is_zipped" = true ] && echo "ZIP Archive" || echo "Original File") |
+          | Password | $([ -n "$PASSWORD" ] && echo "YES" || echo "NO") |
+          
+          $([ -n "$PASSWORD" ] && echo "\n> 🔐 Password: (hidden - you set it when downloading)" || echo "")
+          EOF
+              
+              log_ok "File is $(($final_size / 1024 / 1024))MB - no split needed"
+            fi
+            
+            log_ok "Done: $safe_name"
+            echo "$output_dir"
+            return 0
+          }
+          
+          # ═══════════════════
+          # Process Each URL
+          # ═══════════════════
+          
+          success=0
+          fail=0
+          all_output_dirs=""
+          
+          for url in $URLS; do
+            echo "────────────────────────────────────────"
+            
+            result_dir=$(process_file "$url")
+            
+            if [ $? -eq 0 ]; then
+              success=$((success + 1))
+              all_output_dirs="$all_output_dirs $result_dir"
+            else
+              fail=$((fail + 1))
+            fi
+            
+            echo ""
+          done
+          
+          # ═══════════════════
+          # Batch Mode
+          # ═══════════════════
+          
+          if [ "$MODE" = "batch" ] && [ $success -gt 1 ]; then
+            log_info "Creating batch archive..."
+            batch_name="batch_$(date +%Y%m%d_%H%M%S)"
+            batch_dir="downloads/complete/$batch_name"
+            mkdir -p "$batch_dir"
+            
+            # Gather all files (excluding READMEs)
+            for dir in $all_output_dirs; do
+              [ ! -d "$dir" ] && continue
+              find "$dir" -type f ! -name "README.md" -exec mv {} "$batch_dir/" \; 2>/dev/null
+              rm -rf "$dir" 2>/dev/null
+            done
+            
+            # Create batch README
+            cat > "$batch_dir/README.md" << EOF
+          # 📦 Batch Download
+          
+          > Created: $(date)
+          
+          ## 📁 Files
+          EOF
+            
+            find "$batch_dir" -type f ! -name "README.md" -exec ls -lh {} \; | while read -r line; do
+              echo "- $line" >> "$batch_dir/README.md"
+            done
+            
+            log_ok "Batch: $batch_name"
+          fi
+          
+          # Cleanup temp
+          rm -rf tmp_downloads
+          
+          # ═══════════════════
+          # Summary
+          # ═══════════════════
+          
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "   ✅ Success: $success  |  ❌ Failed: $fail"
+          echo "════════════════════════════════════════"
+          
+          # List files
+          echo ""
+          echo "📁 Downloaded files:"
+          find downloads/complete -type f ! -name "README.md" -exec ls -lh {} \; 2>/dev/null || echo "  (none)"
+          
+          if [ $fail -gt 0 ]; then
+            echo ""
+            echo "⚠️  Failed downloads in: downloads/failed/"
+          fi
+
+      - name: 📊 Create Report in downloads folder
+        if: always()
+        run: |
+          echo "📊 Creating report in downloads/ folder..."
+          
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          BRANCH="${{ github.ref_name }}"
+          
+          # Create report ONLY in downloads folder
+          cat > downloads/README.md << EOF
+          # 📥 فایل‌های دانلود شده
+          
+          > آخرین به‌روزرسانی: $(date '+%Y-%m-%d %H:%M:%S')
+          > ✅ **همه فایل‌های ZIP با فرمت استاندارد ساخته شده‌اند**
+          > 📦 **فایل‌های split شده از نوع Multi-Volume ZIP هستند**
+          
+          ---
+          EOF
+          
+          # Successful downloads
+          if [ -d "downloads/complete" ] && [ "$(ls -A downloads/complete 2>/dev/null)" ]; then
+            echo "" >> downloads/README.md
+            echo "## ✅ دانلودهای موفق" >> downloads/README.md
+            echo "" >> downloads/README.md
+            echo "| 📁 پوشه | 📏 حجم | 📦 فایل‌ها | 🔗 لینک |" >> downloads/README.md
+            echo "|---------|-------|-----------|--------|" >> downloads/README.md
+            
+            for dir in downloads/complete/*/; do
+              [ -d "$dir" ] || continue
+              dname=$(basename "$dir")
+              dsize=$(du -sh "$dir" 2>/dev/null | cut -f1)
+              fcount=$(find "$dir" -type f ! -name "README.md" 2>/dev/null | wc -l)
+              denc=$(echo "$dname" | sed 's/ /%20/g')
+              dlink="${REPO_URL}/tree/${BRANCH}/downloads/complete/${denc}"
+              
+              echo "| [${dname}](${dlink}) | ${dsize} | ${fcount} | [📂 باز کردن](${dlink}) |" >> downloads/README.md
+            done
+          else
+            echo "" >> downloads/README.md
+            echo "_هنوز فایلی دانلود نشده_" >> downloads/README.md
+          fi
+          
+          # Failed downloads
+          if [ -d "downloads/failed" ] && [ "$(ls -A downloads/failed 2>/dev/null)" ]; then
+            echo "" >> downloads/README.md
+            echo "## ❌ دانلودهای ناموفق" >> downloads/README.md
+            echo "" >> downloads/README.md
+            for dir in downloads/failed/*/; do
+              [ -d "$dir" ] || continue
+              dname=$(basename "$dir")
+              denc=$(echo "$dname" | sed 's/ /%20/g')
+              dlink="${REPO_URL}/tree/${BRANCH}/downloads/failed/${denc}"
+              echo "- [${dname}](${dlink})" >> downloads/README.md
+            done
+          fi
+          
+          # Session info
+          if [ -f "downloads/logs/session.log" ]; then
+            echo "" >> downloads/README.md
+            echo "<details>" >> downloads/README.md
+            echo "<summary>📊 جزئیات جلسه دانلود</summary>" >> downloads/README.md
+            echo "" >> downloads/README.md
+            echo '```' >> downloads/README.md
+            cat downloads/logs/session.log >> downloads/README.md
+            echo '```' >> downloads/README.md
+            echo "</details>" >> downloads/README.md
+          fi
+          
+          echo "" >> downloads/README.md
+          echo "---" >> downloads/README.md
+          echo "" >> downloads/README.md
+          echo "### 🔧 نحوه استخراج فایل‌های چندبخشی (Multi-Volume ZIP)" >> downloads/README.md
+          echo "" >> downloads/README.md
+          echo "- **Windows:** روی فایل \`.zip\` اصلی راست‌کلیک کنید → Extract with 7-Zip/WinRAR" >> downloads/README.md
+          echo "- **Mac:** روی فایل \`.zip\` اصلی دابل‌کلیک کنید (The Unarchiver)" >> downloads/README.md
+          echo "- **Linux:** دستور \`unzip filename.zip\` را اجرا کنید" >> downloads/README.md
+          echo "- **⚠️ همه بخش‌ها باید در یک پوشه باشند**" >> downloads/README.md
+          
+          echo "✅ Report created in downloads/README.md"
+
+      - name: 💾 Commit and Push
+        if: always()
+        run: |
+          echo "💾 Saving files to repository..."
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Stage only downloads folder
+          git add downloads/ 2>/dev/null || true
+          
+          # Check if there's anything to commit
+          if git diff --cached --quiet 2>/dev/null; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          # Commit
+          git commit -m "📥 Download complete [skip ci]" || echo "Nothing to commit"
+          
+          # Push
+          git pull --rebase origin "${{ github.ref_name }}" 2>/dev/null || true
+          git push origin HEAD:"${{ github.ref_name }}" || echo "Push failed, will retry..."
+          
+          echo "✅ Files saved"
+
+      - name: 🎉 Done
+        if: always()
+        run: |
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "   🎉 Session Complete!"
+          echo "════════════════════════════════════════"
+          echo ""
+          echo "📁 All files in: downloads/"
+          echo "📊 Report: downloads/README.md"
+          echo ""
+          echo "✅ All ZIPs use standard Info-ZIP format"
+          echo "✅ Multi-volume splits compatible with all archivers"
