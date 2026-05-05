@@ -1,353 +1,55 @@
-name: ⬇️ Download Manager
+name: 🧪 Download Test
 
 on:
   workflow_dispatch:
     inputs:
-      urls:
-        description: 'لینک‌های دانلود (با فاصله جدا کنید)'
+      url:
+        description: 'لینک تست'
         required: true
         type: string
-      mode:
-        description: 'حالت دانلود'
-        required: false
-        default: 'single'
-        type: choice
-        options:
-          - single
-          - batch
-      compression:
-        description: 'فشرده‌سازی'
-        required: false
-        default: 'auto'
-        type: choice
-        options:
-          - auto
-          - always
-          - never
-      password:
-        description: 'رمز فایل zip (اختیاری)'
-        required: false
-        default: ''
-        type: string
-      split_size:
-        description: 'حداکثر حجم هر بخش (MB)'
-        required: false
-        default: '90'
-        type: string
+        default: 'https://httpbin.org/bytes/1024'
 
 jobs:
-  download-files:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    permissions:
-      contents: write
-    
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
-
-      - name: Install Tools
+        
+      - name: Test Download
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 zip unzip curl wget bc p7zip-full
-
-      - name: Download and Process
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-        run: |
-          #!/bin/bash
-          
-          # Settings
-          SPLIT_MB="${{ github.event.inputs.split_size }}"
-          SPLIT_BYTES=$((SPLIT_MB * 1024 * 1024))
-          PASSWORD="${{ github.event.inputs.password }}"
-          COMPRESSION="${{ github.event.inputs.compression }}"
-          MODE="${{ github.event.inputs.mode }}"
-          URLS="${{ github.event.inputs.urls }}"
-          
-          # Create folders
-          mkdir -p downloads
-          mkdir -p tmp
-          
-          # Simple log
-          log_msg() {
-            echo "[$(date +%H:%M:%S)] $1"
-          }
-          
-          # Sanitize filename
-          clean_name() {
-            echo "$1" | sed 's/[^a-zA-Z0-9._-]/_/g'
-          }
-          
-          # Check if should compress
-          should_zip() {
-            local f="$1"
-            local mode="$2"
-            if [ "$mode" = "always" ]; then
-              return 0
-            elif [ "$mode" = "never" ]; then
-              return 1
-            else
-              local ext="${f##*.}"
-              ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
-              case "$ext" in
-                zip|rar|7z|gz|bz2|xz|tar|iso|exe|msi|mp4|mkv|avi|mp3|jpg|png|pdf)
-                  return 1 ;;
-                *)
-                  return 0 ;;
-              esac
-            fi
-          }
-          
-          # Download a file
-          download_file() {
-            local url="$1"
-            local out="$2"
-            local name="$3"
-            
-            for attempt in 1 2 3; do
-              log_msg "Downloading $name (attempt $attempt)"
-              
-              if aria2c -q -x4 -s4 --max-tries=1 --timeout=30 \
-                -d "$(dirname "$out")" -o "$(basename "$out")" "$url" 2>/dev/null; then
-                if [ -s "$out" ]; then
-                  log_msg "OK: $name"
-                  return 0
-                fi
-              fi
-              
-              if wget -q -O "$out" --timeout=30 "$url" 2>/dev/null; then
-                if [ -s "$out" ]; then
-                  log_msg "OK: $name"
-                  return 0
-                fi
-              fi
-              
-              if curl -L -o "$out" --connect-timeout 30 -s "$url" 2>/dev/null; then
-                if [ -s "$out" ]; then
-                  log_msg "OK: $name"
-                  return 0
-                fi
-              fi
-              
-              sleep 10
-            done
-            
-            log_msg "FAILED: $name"
-            return 1
-          }
-          
-          # Process one URL
-          process_one() {
-            local url="$1"
-            
-            local filename=$(basename "$url" | sed 's/?.*//' | sed 's/#.*//')
-            if [ -z "$filename" ] || [ "$filename" = "/" ]; then
-              filename="download_$(date +%s)"
-            fi
-            
-            local safe_name=$(clean_name "$filename")
-            local base="${safe_name%.*}"
-            if [ -z "$base" ]; then
-              base="$safe_name"
-            fi
-            
-            local tmp_file="tmp/${safe_name}"
-            local out_dir="downloads/${base}"
-            
-            mkdir -p "$out_dir"
-            
-            log_msg "Processing: $safe_name"
-            
-            # Download
-            if ! download_file "$url" "$tmp_file" "$safe_name"; then
-              echo "FAILED: $url" > "$out_dir/FAILED.txt"
-              return 1
-            fi
-            
-            # Get size
-            local size=0
-            if [ -f "$tmp_file" ]; then
-              size=$(stat -c%s "$tmp_file" 2>/dev/null || echo 0)
-            fi
-            local size_mb=$((size / 1024 / 1024))
-            
-            log_msg "Size: ${size_mb}MB"
-            
-            # Move to output
-            mv "$tmp_file" "$out_dir/$safe_name"
-            
-            local work_file="$safe_name"
-            local work_dir="$out_dir"
-            
-            # Compress if needed
-            if should_zip "$safe_name" "$COMPRESSION"; then
-              log_msg "Compressing to ZIP..."
-              
-              if [ -n "$PASSWORD" ]; then
-                zip -j -P "$PASSWORD" "$work_dir/${safe_name}.zip" "$work_dir/$safe_name" 2>/dev/null
-              else
-                zip -j "$work_dir/${safe_name}.zip" "$work_dir/$safe_name" 2>/dev/null
-              fi
-              
-              if [ -f "$work_dir/${safe_name}.zip" ]; then
-                rm -f "$work_dir/$safe_name"
-                work_file="${safe_name}.zip"
-                size=$(stat -c%s "$work_dir/$work_file" 2>/dev/null || echo 0)
-                size_mb=$((size / 1024 / 1024))
-                log_msg "ZIP: ${size_mb}MB"
-              fi
-            fi
-            
-            # Split if too large
-            if [ "$size" -gt "$SPLIT_BYTES" ]; then
-              log_msg "Splitting into ${SPLIT_MB}MB parts..."
-              
-              # Wrap in ZIP if not already
-              if [ "${work_file##*.}" != "zip" ]; then
-                log_msg "Wrapping in ZIP first..."
-                
-                if [ -n "$PASSWORD" ]; then
-                  zip -j -P "$PASSWORD" "$work_dir/${base}.zip" "$work_dir/$work_file" 2>/dev/null
-                else
-                  zip -j "$work_dir/${base}.zip" "$work_dir/$work_file" 2>/dev/null
-                fi
-                
-                rm -f "$work_dir/$work_file"
-                work_file="${base}.zip"
-                size=$(stat -c%s "$work_dir/$work_file" 2>/dev/null || echo 0)
-              fi
-              
-              # Split using 7z
-              7z a -tzip -v${SPLIT_MB}m "$work_dir/${base}.zip" "$work_dir/$work_file" 2>/dev/null
-              
-              if ls "$work_dir/${base}.zip".* >/dev/null 2>&1; then
-                rm -f "$work_dir/$work_file"
-                
-                local part_count=$(ls -1 "$work_dir/${base}.zip".* 2>/dev/null | wc -l)
-                log_msg "Split into ${part_count} parts"
-                
-                # Write README
-                echo "# Split ZIP: $safe_name" > "$work_dir/README.md"
-                echo "" >> "$work_dir/README.md"
-                echo "Total parts: $part_count" >> "$work_dir/README.md"
-                echo "Total size: ${size_mb}MB" >> "$work_dir/README.md"
-                if [ -n "$PASSWORD" ]; then
-                  echo "Password: YES (you set it)" >> "$work_dir/README.md"
-                fi
-                echo "" >> "$work_dir/README.md"
-                echo "## How to Open" >> "$work_dir/README.md"
-                echo "" >> "$work_dir/README.md"
-                echo "- Android: Open .zip.001 with ZArchiver" >> "$work_dir/README.md"
-                echo "- iOS: Open .zip.001 with iZip" >> "$work_dir/README.md"
-                echo "- Windows: Open .zip.001 with 7-Zip" >> "$work_dir/README.md"
-                echo "- Mac: Double-click .zip.001" >> "$work_dir/README.md"
-                echo "- Linux: 7z x file.zip.001" >> "$work_dir/README.md"
-                echo "" >> "$work_dir/README.md"
-                echo "Just open the FIRST part (.zip.001)!" >> "$work_dir/README.md"
-              else
-                log_msg "Split failed"
-              fi
-            else
-              # Write README
-              echo "# File: $safe_name" > "$work_dir/README.md"
-              echo "" >> "$work_dir/README.md"
-              echo "File: $work_file" >> "$work_dir/README.md"
-              echo "Size: ${size_mb}MB" >> "$work_dir/README.md"
-              if [ -n "$PASSWORD" ]; then
-                echo "Password: YES" >> "$work_dir/README.md"
-              fi
-            fi
-            
-            log_msg "Done: $safe_name"
-            return 0
-          }
-          
-          # ═════════════════════════
-          # MAIN
-          # ═════════════════════════
-          
-          echo "═══════════════════════════════════"
-          echo "  Download Manager"
-          echo "═══════════════════════════════════"
-          echo "Mode: $MODE"
-          echo "Split: ${SPLIT_MB}MB"
+          echo "=== Download Test ==="
+          echo "URL: ${{ github.event.inputs.url }}"
           echo ""
           
-          success=0
-          failed=0
-          dirs=""
+          # Test with all methods
+          echo "1. Testing curl..."
+          curl -L -o test_curl.dat "${{ github.event.inputs.url }}" -w "  Size: %{size_download} bytes\n  Time: %{time_total}s\n" 2>&1 || echo "  FAILED"
           
-          for url in $URLS; do
-            echo "---"
-            if process_one "$url"; then
-              success=$((success + 1))
-              dirs="$dirs downloads/$(clean_name $(basename "$url" | sed 's/?.*//' | sed 's/#.*//' | sed 's/\.[^.]*$//'))"
-            else
-              failed=$((failed + 1))
-            fi
-          done
+          echo "2. Testing wget..."
+          wget -O test_wget.dat "${{ github.event.inputs.url }}" 2>&1 || echo "  FAILED"
+          ls -lh test_wget.dat 2>/dev/null || echo "  No file created"
           
-          # Batch mode
-          if [ "$MODE" = "batch" ] && [ "$success" -gt 1 ]; then
-            batch="downloads/batch_$(date +%Y%m%d_%H%M%S)"
-            mkdir -p "$batch"
-            for d in $dirs; do
-              if [ -d "$d" ]; then
-                cp -r "$d"/* "$batch/" 2>/dev/null
-                rm -rf "$d"
-              fi
-            done
-            log_msg "Batch: $batch"
-          fi
+          echo "3. Testing aria2..."
+          sudo apt-get update -qq && sudo apt-get install -y -qq aria2
+          aria2c -d . -o test_aria2.dat "${{ github.event.inputs.url }}" 2>&1 || echo "  FAILED"
+          ls -lh test_aria2.dat 2>/dev/null || echo "  No file created"
           
-          # Cleanup
-          rm -rf tmp
-          
-          # Summary
           echo ""
-          echo "═══════════════════════════════════"
-          echo "  Done: $success OK, $failed Failed"
-          echo "═══════════════════════════════════"
-          
-          # List files
-          find downloads -type f -name "*.zip" -o -name "*.zip.*" 2>/dev/null | while read f; do
-            ls -lh "$f" 2>/dev/null
-          done
+          echo "=== Results ==="
+          ls -lh test_*.dat 2>/dev/null || echo "No files downloaded!"
 
-      - name: Save to Repo
+      - name: Save Results
         if: always()
         run: |
+          mkdir -p downloads
+          if [ -f test_curl.dat ]; then
+            cp test_curl.dat downloads/
+            echo "Download successful!" > downloads/README.md
+          fi
+          
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads/ 2>/dev/null || true
-          
-          if git diff --cached --quiet 2>/dev/null; then
-            echo "Nothing to commit"
-            exit 0
-          fi
-          
-          git commit -m "Download complete [skip ci]" 2>/dev/null || true
-          git pull --rebase origin ${{ github.ref_name }} 2>/dev/null || true
-          git push origin HEAD:${{ github.ref_name }} 2>/dev/null || true
-          echo "Saved"
-
-      - name: Summary
-        if: always()
-        run: |
-          echo ""
-          echo "═══════════════════════════════════"
-          echo "  Complete!"
-          echo "═══════════════════════════════════"
-          echo ""
-          if [ -d "downloads" ]; then
-            echo "Files:"
-            find downloads -type f -name "*.zip" -o -name "*.zip.*" 2>/dev/null | while read f; do
-              echo "  $(ls -lh "$f" | awk '{print $5, $NF}')"
-            done
-          fi
-          echo ""
-          echo "Open .zip.001 directly with ZArchiver/7-Zip!"
+          git add downloads/ 2>/dev/null
+          git commit -m "Test download" 2>/dev/null || true
+          git push 2>/dev/null || echo "Push skipped (no changes or permission issue)"
