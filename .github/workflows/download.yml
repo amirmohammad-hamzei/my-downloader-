@@ -51,20 +51,33 @@ jobs:
 
       - name: 📦 Install Dependencies
         run: |
+          echo "Installing dependencies..."
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 zip unzip curl wget bc p7zip-full p7zip-rar
+          echo "✅ Dependencies installed"
+          echo ""
+          echo "Versions:"
+          zip --version 2>&1 | head -1 || echo "zip: not found"
+          unzip -v 2>&1 | head -1 || echo "unzip: not found"
+          7z --help 2>&1 | head -2 || echo "7z: not found"
 
       - name: 📥 Download and Process Files
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: |
-          set -e
+          # ═══════════════════════════════
+          # Download Manager
+          # ═══════════════════════════════
           
+          set +e  # Don't stop on error, handle manually
+          
+          # Create directories
           mkdir -p downloads/complete
           mkdir -p downloads/failed
           mkdir -p downloads/logs
           mkdir -p tmp_downloads
           
+          # Settings
           SPLIT_MB="${{ github.event.inputs.split_size }}"
           SPLIT_BYTES=$((SPLIT_MB * 1024 * 1024))
           PASSWORD="${{ github.event.inputs.password }}"
@@ -73,17 +86,30 @@ jobs:
           URLS="${{ github.event.inputs.urls }}"
           MAX_RETRIES=3
           
+          # Log file
+          LOG_FILE="downloads/logs/session.log"
+          echo "═══ Session: $(date) ═══" > "$LOG_FILE"
+          
           echo "════════════════════════════════════════"
           echo "   🚀 Download Manager"
           echo "════════════════════════════════════════"
           echo "Mode: $MODE | Compression: $COMPRESSION"
           echo "Split: ${SPLIT_MB}MB | Password: $([ -n "$PASSWORD" ] && echo 'YES' || echo 'NO')"
-          echo "Format: 7z Multi-Volume (open directly!)"
           echo ""
           
-          log_ok() { echo "✅ $1"; echo "✅ $1" >> downloads/logs/session.log; }
-          log_err() { echo "❌ $1"; echo "❌ $1" >> downloads/logs/session.log; }
-          log_info() { echo "ℹ️  $1"; }
+          # Helper functions
+          log_ok() { 
+            echo "✅ $1"
+            echo "[OK] $(date '+%H:%M:%S') - $1" >> "$LOG_FILE"
+          }
+          log_err() { 
+            echo "❌ $1"
+            echo "[ERROR] $(date '+%H:%M:%S') - $1" >> "$LOG_FILE"
+          }
+          log_info() { 
+            echo "ℹ️  $1"
+            echo "[INFO] $(date '+%H:%M:%S') - $1" >> "$LOG_FILE"
+          }
           
           sanitize() {
             echo "$1" | sed 's/[<>:"|?*\\]/_/g' | sed 's/%20/ /g' | sed 's/[?#].*//'
@@ -98,7 +124,8 @@ jobs:
               auto)
                 local ext=$(echo "${f##*.}" | tr '[:upper:]' '[:lower:]')
                 case "$ext" in
-                  zip|rar|7z|gz|bz2|xz|tar|iso|dmg|exe|msi|mp4|mkv|avi|mp3|jpg|png|pdf) return 1 ;;
+                  zip|rar|7z|gz|bz2|xz|tar|iso|dmg|exe|msi|mp4|mkv|avi|mp3|jpg|png|pdf)
+                    return 1 ;;
                   *) return 0 ;;
                 esac ;;
             esac
@@ -110,282 +137,320 @@ jobs:
             local fname=$(basename "$output")
             
             for try in $(seq 1 $MAX_RETRIES); do
-              log_info "Attempt $try/$MAX_RETRIES: $fname"
+              log_info "Download attempt $try/$MAX_RETRIES: $fname"
               
-              if timeout 600 aria2c -q --split=4 --max-connection-per-server=4 \
+              # Method 1: aria2
+              log_info "  Trying aria2..."
+              aria2c -q --split=4 --max-connection-per-server=4 \
                 --min-split-size=20M --max-tries=2 --retry-wait=5 \
                 --timeout=60 --connect-timeout=30 --check-certificate=true \
                 --allow-overwrite=true --auto-file-renaming=false \
-                --dir="$(dirname "$output")" --out="$fname" "$url" 2>/dev/null; then
-                [ -s "$output" ] && { log_ok "Downloaded: $fname"; return 0; }
+                --dir="$(dirname "$output")" --out="$fname" "$url" 2>/dev/null
+              
+              if [ -f "$output" ] && [ -s "$output" ]; then
+                log_ok "Downloaded with aria2: $fname"
+                return 0
               fi
               
-              if timeout 600 wget -q --show-progress --tries=2 --timeout=60 \
-                -U "Mozilla/5.0" -O "$output" "$url" 2>&1; then
-                [ -s "$output" ] && { log_ok "Downloaded: $fname"; return 0; }
+              # Method 2: wget
+              log_info "  Trying wget..."
+              wget -q --show-progress --tries=2 --timeout=60 \
+                -U "Mozilla/5.0" -O "$output" "$url" 2>/dev/null
+              
+              if [ -f "$output" ] && [ -s "$output" ]; then
+                log_ok "Downloaded with wget: $fname"
+                return 0
               fi
               
-              if timeout 600 curl -L -f -# --retry 2 --retry-delay 5 \
+              # Method 3: curl
+              log_info "  Trying curl..."
+              curl -L -f -# --retry 2 --retry-delay 5 \
                 --connect-timeout 30 --max-time 3600 \
-                -A "Mozilla/5.0" -o "$output" "$url" 2>&1; then
-                [ -s "$output" ] && { log_ok "Downloaded: $fname"; return 0; }
+                -A "Mozilla/5.0" -o "$output" "$url" 2>/dev/null
+              
+              if [ -f "$output" ] && [ -s "$output" ]; then
+                log_ok "Downloaded with curl: $fname"
+                return 0
               fi
               
-              [ $try -lt $MAX_RETRIES ] && sleep $((try * 15))
+              if [ $try -lt $MAX_RETRIES ]; then
+                log_info "  Waiting ${try}5s before retry..."
+                sleep $((try * 15))
+              fi
             done
             
             rm -f "$output"
-            log_err "Failed: $fname"
+            log_err "Download failed: $fname"
             return 1
           }
-
+          
+          # ═══════════════════════════════
+          # Create multi-volume ZIP with 7z
+          # ═══════════════════════════════
+          
+          create_multivolume_zip() {
+            local input_file="$1"
+            local output_dir="$2"
+            local output_name="$3"
+            local vol_size="$4"
+            local pass="$5"
+            
+            cd "$output_dir" || return 1
+            
+            log_info "Creating multi-volume ZIP: ${output_name}.zip.001..."
+            
+            # 7z command for multi-volume ZIP
+            local cmd="7z a -tzip -v${vol_size}m"
+            [ -n "$pass" ] && cmd="$cmd -p${pass} -mhe=on"
+            cmd="$cmd ${output_name}.zip ${input_file}"
+            
+            log_info "  Running: $cmd"
+            
+            if $cmd > /dev/null 2>&1; then
+              log_ok "Multi-volume ZIP created successfully"
+              
+              # Verify parts exist
+              local part_count=$(ls -1 ${output_name}.zip.* 2>/dev/null | wc -l)
+              if [ "$part_count" -gt 0 ]; then
+                log_info "  Created ${part_count} parts"
+                return 0
+              else
+                log_err "No parts created!"
+                return 1
+              fi
+            else
+              log_err "7z command failed!"
+              return 1
+            fi
+          }
+          
           # ═══════════════════════════════
           # Process single URL
           # ═══════════════════════════════
-
-          process_file() {
+          
+          process_url() {
             local url="$1"
+            local url_num="$2"
             
+            echo ""
+            echo "────────────────────────────────────────"
+            echo "  [#${url_num}] Processing..."
+            echo "────────────────────────────────────────"
+            
+            # Extract filename
             local original_name=$(basename "$url" | sed 's/%20/ /g' | sed 's/[?#].*//')
+            [ -z "$original_name" ] && original_name="download_${url_num}"
+            
             local safe_name=$(sanitize "$original_name")
-            local temp_file="tmp_downloads/${safe_name}"
             local base_name="${safe_name%.*}"
+            [ -z "$base_name" ] && base_name="file_${url_num}"
+            
+            local temp_file="tmp_downloads/${safe_name}"
             local output_dir="downloads/complete/${base_name}"
             
-            echo "────────────────────────────────────────"
             log_info "URL: $url"
-            log_info "File: $safe_name"
+            log_info "Filename: $safe_name"
+            log_info "Output dir: $output_dir"
             
             # Download
             if ! download_file "$url" "$temp_file"; then
               local err_dir="downloads/failed/${base_name}_$(date +%s)"
               mkdir -p "$err_dir"
-              printf "# ❌ Download Failed\n\n| Info | Value |\n|------|-------|\n| File | %s |\n| URL | %s |\n| Date | %s |\n\n## Possible Fixes\n1. Check URL\n2. Try again later\n3. Server may block bots\n" "$safe_name" "$url" "$(date)" > "$err_dir/README.md"
+              cat > "$err_dir/README.md" << README_EOF
+# ❌ Download Failed
+
+| Info | Value |
+|------|-------|
+| File | $safe_name |
+| URL | $url |
+| Date | $(date) |
+
+Try again or check the URL in browser.
+README_EOF
+              echo "1" > "$err_dir/status.txt"
               return 1
             fi
             
-            local size=$(stat -c%s "$temp_file" 2>/dev/null || echo 0)
-            local size_mb=$((size / 1024 / 1024))
+            # Get file size
+            local file_size=0
+            [ -f "$temp_file" ] && file_size=$(stat -c%s "$temp_file" 2>/dev/null || echo 0)
+            local file_size_mb=$((file_size / 1024 / 1024))
             
+            log_info "Downloaded: ${file_size_mb}MB"
+            
+            # Create output directory
             mkdir -p "$output_dir"
             
-            # Move file
+            # Move to output
             mv "$temp_file" "$output_dir/$safe_name"
-            cd "$output_dir"
+            cd "$output_dir" || return 1
             
-            local current_file="$safe_name"
+            local work_file="$safe_name"
+            local final_size=$file_size
             
-            # ═══════════════════
-            # Decide: compress or not
-            # ═══════════════════
+            # ─── Step 1: Compress if needed ───
             
             if need_compress "$safe_name" "$COMPRESSION"; then
-              log_info "Creating ZIP (${size_mb}MB)..."
-              
-              local zip_name="${safe_name}.zip"
+              log_info "Creating ZIP..."
               
               if [ -n "$PASSWORD" ]; then
-                7z a -tzip -p"$PASSWORD" -mhe=on "$zip_name" "$current_file" > /dev/null 2>&1
+                zip -j -P "$PASSWORD" "${safe_name}.zip" "$safe_name" 2>/dev/null
               else
-                7z a -tzip "$zip_name" "$current_file" > /dev/null 2>&1
+                zip -j "${safe_name}.zip" "$safe_name" 2>/dev/null
               fi
               
-              rm -f "$current_file"
-              current_file="$zip_name"
-              
-              local new_size=$(stat -c%s "$current_file" 2>/dev/null || echo 0)
-              log_ok "Created: $current_file ($(($new_size / 1024 / 1024))MB)"
+              if [ -f "${safe_name}.zip" ]; then
+                rm -f "$safe_name"
+                work_file="${safe_name}.zip"
+                final_size=$(stat -c%s "$work_file" 2>/dev/null || echo 0)
+                log_ok "ZIP created: ${work_file} ($(($final_size / 1024 / 1024))MB)"
+              else
+                log_err "ZIP creation failed, keeping original"
+              fi
             else
-              log_ok "Saved: $current_file (${size_mb}MB)"
-              
-              # If huge file and not zipped, wrap in store-only ZIP
-              if [ "$size" -gt "$SPLIT_BYTES" ]; then
-                log_info "Wrapping in ZIP for splitting..."
-                
-                local wrap_zip="${base_name}.zip"
-                
-                if [ -n "$PASSWORD" ]; then
-                  7z a -tzip -mx=0 -p"$PASSWORD" -mhe=on "$wrap_zip" "$current_file" > /dev/null 2>&1
-                else
-                  7z a -tzip -mx=0 "$wrap_zip" "$current_file" > /dev/null 2>&1
-                fi
-                
-                rm -f "$current_file"
-                current_file="$wrap_zip"
-                log_ok "Wrapped: $wrap_zip"
-              fi
+              log_info "No compression needed"
             fi
             
-            local final_size=$(stat -c%s "$current_file" 2>/dev/null || echo 0)
-            local final_size_mb=$((final_size / 1024 / 1024))
-            
-            # ═══════════════════
-            # Split if needed (7z multi-volume)
-            # ═══════════════════
+            # ─── Step 2: Split if too large ───
             
             if [ "$final_size" -gt "$SPLIT_BYTES" ]; then
-              log_info "Splitting ${final_size_mb}MB into ${SPLIT_MB}MB parts..."
+              log_info "File is $(($final_size / 1024 / 1024))MB, splitting..."
               
-              local archive_name="$current_file"
-              
-              # Split using 7z: creates file.zip.001, file.zip.002, ...
-              # IMPORTANT: -v switch for volume size
-              if [ -n "$PASSWORD" ]; then
-                # Re-create with volume split
-                local temp_extract="temp_extract_$$"
-                mkdir "$temp_extract"
-                cp "$archive_name" "$temp_extract/"
-                cd "$temp_extract"
-                unzip -P "$PASSWORD" "$archive_name" > /dev/null 2>&1 || true
-                rm -f "$archive_name"
+              # If not a ZIP, wrap it first
+              if [[ "$work_file" != *.zip ]]; then
+                log_info "Wrapping in ZIP..."
                 
-                # Find the extracted file
-                local extracted=$(ls | head -1)
-                
-                # Create multi-volume 7z (zip format)
-                7z a -tzip -v${SPLIT_MB}m -p"$PASSWORD" -mhe=on "../${base_name}.zip" "$extracted" > /dev/null 2>&1
-                
-                cd ..
-                rm -rf "$temp_extract" "$archive_name"
-              else
-                # Check if it's a zip we can re-split
-                local temp_extract="temp_extract_$$"
-                mkdir "$temp_extract"
-                cp "$archive_name" "$temp_extract/"
-                cd "$temp_extract"
-                
-                # Try to extract
-                if unzip -o "$archive_name" > /dev/null 2>&1; then
-                  rm -f "$archive_name"
-                  local extracted=$(ls | head -1)
-                  7z a -tzip -v${SPLIT_MB}m "../${base_name}.zip" "$extracted" > /dev/null 2>&1
+                if [ -n "$PASSWORD" ]; then
+                  zip -j -P "$PASSWORD" "${base_name}.zip" "$work_file" 2>/dev/null
                 else
-                  # Can't extract, split the zip as-is
-                  7z a -tzip -v${SPLIT_MB}m "../${base_name}.zip" "$archive_name" > /dev/null 2>&1
+                  zip -j "${base_name}.zip" "$work_file" 2>/dev/null
                 fi
                 
-                cd ..
-                rm -rf "$temp_extract" "$archive_name"
+                if [ -f "${base_name}.zip" ]; then
+                  rm -f "$work_file"
+                  work_file="${base_name}.zip"
+                  final_size=$(stat -c%s "$work_file" 2>/dev/null || echo 0)
+                  log_ok "Wrapped: ${work_file}"
+                fi
               fi
+              
+              # Create multi-volume ZIP
+              create_multivolume_zip "$work_file" "$output_dir" "$base_name" "$SPLIT_MB" "$PASSWORD"
+              
+              # Remove original large file (keep only parts)
+              rm -f "$work_file"
               
               # Count parts
               local part_count=$(ls -1 ${base_name}.zip.* 2>/dev/null | wc -l)
-              
-              # Rename: file.zip.001 → file.zip.001, etc (already correct)
-              # 7z creates file.zip.001, file.zip.002, ...
-              
-              log_ok "Split into ${part_count} parts (open .zip.001 directly!)"
+              local total_size_mb=$(($final_size / 1024 / 1024))
               
               # Create README
-              {
-                echo "# 📦 Multi-Volume ZIP: $safe_name"
-                echo ""
-                echo "> ✨ **NO JOINING NEEDED!** Open \`.zip.001\` directly!"
-                echo "> Total: ${final_size_mb}MB → ${part_count} parts"
-                echo ""
-                echo "| Info | Value |"
-                echo "|------|-------|"
-                echo "| Original | $safe_name |"
-                echo "| Total Size | ${final_size_mb} MB |"
-                echo "| Parts | ${part_count} |"
-                echo "| Password | $([ -n "$PASSWORD" ] && echo "YES 🔐" || echo "NO") |"
-                echo ""
-                echo "## 📁 Parts"
-                
-                for part in ${base_name}.zip.*; do
-                  [ -f "$part" ] || continue
-                  local psize=$(ls -lh "$part" 2>/dev/null | awk '{print $5}')
-                  echo "- \`$part\` ($psize)"
-                done
-                
-                echo ""
-                echo "## 🎯 How to Open (NO JOINING!)"
-                echo ""
-                echo "| Platform | Action |"
-                echo "|----------|--------|"
-                echo "| **📱 Android** | Open \`.zip.001\` with **ZArchiver** |"
-                echo "| **📱 iOS** | Open with **iZip** or **Unzip** |"
-                echo "| **🖥️ Windows** | Right-click \`.zip.001\` → **7-Zip** → Extract |"
-                echo "| **🖥️ WinRAR** | Open \`.zip.001\` directly |"
-                echo "| **🍎 Mac** | Double-click \`.zip.001\` (**The Unarchiver**) |"
-                echo "| **🐧 Linux** | \`7z x ${base_name}.zip.001\` |"
-                echo ""
-                echo "## ⚠️ Remember"
-                echo "- ✅ Download ALL parts to the SAME folder"
-                echo "- ✅ Open the **FIRST part** (\`.zip.001\`)"
-                echo "- ✅ The program AUTOMATICALLY reads all parts"
-                echo "- ❌ Do NOT rename files"
-                echo "- ❌ No need to \"join\" or \"merge\" anything!"
-                
-                if [ -n "$PASSWORD" ]; then
-                  echo ""
-                  echo "> 🔐 **Password:** The one you set when downloading"
-                fi
-              } > "README.md"
+              cat > "README.md" << README_EOF
+# 📦 Multi-Volume ZIP: $safe_name
+
+> ✨ **OPEN DIRECTLY!** Just open \`.zip.001\` 
+> 📱 Works on ALL devices - no joining needed!
+
+| Info | Value |
+|------|-------|
+| Original | $safe_name |
+| Size | ${total_size_mb} MB |
+| Parts | ${part_count} |
+| Password | $([ -n "$PASSWORD" ] && echo "YES 🔐" || echo "NO") |
+| Format | 7z Multi-Volume ZIP |
+
+## 📁 Files
+
+README_EOF
+              
+              ls -lh ${base_name}.zip.* 2>/dev/null | while read line; do
+                echo "$line" >> "README.md"
+              done
+              
+              cat >> "README.md" << 'README_EOF'
+
+## 🎯 How to Extract (NO JOINING!)
+
+| Platform | Action |
+|----------|--------|
+| **📱 Android** | Open `.zip.001` with **ZArchiver** |
+| **📱 iOS** | Open `.zip.001` with **iZip** |
+| **🖥️ Windows** | Right-click `.zip.001` → **7-Zip** → Extract |
+| **🍎 Mac** | Double-click `.zip.001` (**The Unarchiver**) |
+| **🐧 Linux** | `7z x file.zip.001` |
+
+## ⚠️ Important
+- Download ALL parts to the SAME folder
+- Open ONLY the **first part** (`.zip.001`)
+- The app reads all parts automatically
+- No "cat", no "join", no "merge" needed!
+README_EOF
+              
+              [ -n "$PASSWORD" ] && echo "" >> "README.md" && echo "> 🔐 **Password required!**" >> "README.md"
+              
+              log_ok "Split into ${part_count} parts"
               
             else
               # No split needed
-              {
-                echo "# 📦 File: $safe_name"
-                echo ""
-                echo "| Info | Value |"
-                echo "|------|-------|"
-                echo "| File | $current_file |"
-                echo "| Size | ${final_size_mb} MB |"
-                echo "| Password | $([ -n "$PASSWORD" ] && echo "YES 🔐" || echo "NO") |"
-                echo ""
-                echo "## 📱 Extract on..."
-                echo ""
-                echo "| Platform | App |"
-                echo "|----------|-----|"
-                echo "| Android | ZArchiver |"
-                echo "| iOS | iZip |"
-                echo "| Windows | 7-Zip / WinRAR |"
-                echo "| Mac | Double-click |"
-                echo "| Linux | unzip / 7z |"
-                
-                if [ -n "$PASSWORD" ]; then
-                  echo ""
-                  echo "> 🔐 **Password:** The one you set"
-                fi
-              } > "README.md"
+              local final_mb=$((final_size / 1024 / 1024))
+              [ $final_mb -eq 0 ] && final_mb=1
               
-              log_ok "File is ${final_size_mb}MB - no split needed"
+              cat > "README.md" << README_EOF
+# 📦 File: $safe_name
+
+| Info | Value |
+|------|-------|
+| File | $work_file |
+| Size | ${final_mb} MB |
+| Password | $([ -n "$PASSWORD" ] && echo "YES 🔐" || echo "NO") |
+
+## 📱 Extract with
+- **Android:** ZArchiver
+- **iOS:** iZip
+- **Windows:** 7-Zip / WinRAR
+- **Mac:** Double-click
+- **Linux:** unzip / 7z
+README_EOF
+              
+              [ -n "$PASSWORD" ] && echo "" >> "README.md" && echo "> 🔐 **Password required!**" >> "README.md"
+              
+              log_ok "No split needed (${final_mb}MB)"
             fi
             
             cd - > /dev/null
-            log_ok "Done: $safe_name"
+            log_ok "Completed: $safe_name"
             echo "$output_dir"
             return 0
           }
           
-          # ═══════════════════
-          # Process All URLs
-          # ═══════════════════
+          # ═══════════════════════════════
+          # Main: Process all URLs
+          # ═══════════════════════════════
           
           success=0
           fail=0
           all_output_dirs=""
+          url_num=0
           
           for url in $URLS; do
-            result_dir=$(process_file "$url")
+            url_num=$((url_num + 1))
             
-            if [ $? -eq 0 ]; then
+            result=$(process_url "$url" "$url_num")
+            exit_code=$?
+            
+            if [ $exit_code -eq 0 ]; then
               success=$((success + 1))
-              all_output_dirs="$all_output_dirs $result_dir"
+              all_output_dirs="$all_output_dirs $result"
             else
               fail=$((fail + 1))
             fi
-            
-            echo ""
           done
           
-          # ═══════════════════
-          # Batch Mode
-          # ═══════════════════
-          
+          # Batch mode
           if [ "$MODE" = "batch" ] && [ $success -gt 1 ]; then
-            log_info "Creating batch archive..."
+            echo ""
+            echo "────────────────────────────────────────"
+            log_info "Creating batch..."
             
             batch_name="batch_$(date +%Y%m%d_%H%M%S)"
             batch_dir="downloads/complete/$batch_name"
@@ -400,22 +465,46 @@ jobs:
             log_ok "Batch: $batch_name"
           fi
           
+          # Cleanup
           rm -rf tmp_downloads
           
-          # Summary
-          echo ""
-          echo "════════════════════════════════════════"
-          echo "   ✅ Success: $success  |  ❌ Failed: $fail"
-          echo "════════════════════════════════════════"
-          echo ""
-          echo "📁 Files (open .zip.001 directly!):"
-          find downloads/complete -type f \( -name "*.zip" -o -name "*.zip.*" \) -exec ls -lh {} \; 2>/dev/null
+          # ═══════════════════════════════
+          # Final Summary
+          # ═══════════════════════════════
           
-          [ $fail -gt 0 ] && echo "" && echo "⚠️  Failed: downloads/failed/"
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "   📊 RESULTS"
+          echo "════════════════════════════════════════"
+          echo ""
+          echo "  ✅ Successful: $success"
+          echo "  ❌ Failed: $fail"
+          echo ""
+          
+          if [ $success -gt 0 ]; then
+            echo "📁 Files in downloads/complete/:"
+            find downloads/complete -type f \( -name "*.zip" -o -name "*.zip.*" -o -name "*.rar" -o -name "*.7z" \) 2>/dev/null | while read f; do
+              ls -lh "$f" 2>/dev/null
+            done
+            echo ""
+            echo "📱 Open .zip.001 directly with ZArchiver/7-Zip!"
+          fi
+          
+          if [ $fail -gt 0 ]; then
+            echo "⚠️  Failed downloads: downloads/failed/"
+          fi
+          
+          echo ""
+          echo "Full log: downloads/logs/session.log"
+          
+          # Exit with success even if some downloads failed
+          exit 0
 
       - name: 📊 Create Report
         if: always()
         run: |
+          echo "Creating report..."
+          
           REPO_URL="${{ github.server_url }}/${{ github.repository }}"
           BRANCH="${{ github.ref_name }}"
           
@@ -423,14 +512,13 @@ jobs:
             echo "# 📥 Downloaded Files"
             echo ""
             echo "> Updated: $(date '+%Y-%m-%d %H:%M:%S')"
-            echo "> ✨ **Multi-volume ZIP: Open .zip.001 directly!**"
-            echo "> 📱 Works on Android, iOS, Windows, Mac, Linux"
+            echo "> ✨ **Multi-volume ZIP (.zip.001) - open directly!**"
             echo ""
             echo "---"
             
             if [ -d "downloads/complete" ] && [ "$(ls -A downloads/complete 2>/dev/null)" ]; then
               echo ""
-              echo "## ✅ Successful Downloads"
+              echo "## ✅ Downloads"
               echo ""
               echo "| Folder | Size | Files | Link |"
               echo "|--------|------|-------|------|"
@@ -441,9 +529,11 @@ jobs:
                 dsize=$(du -sh "$dir" 2>/dev/null | cut -f1)
                 fcount=$(find "$dir" -type f ! -name "README.md" 2>/dev/null | wc -l)
                 denc=$(echo "$dname" | sed 's/ /%20/g')
-                dlink="${REPO_URL}/tree/${BRANCH}/downloads/complete/${denc}"
-                echo "| [${dname}](${dlink}) | ${dsize} | ${fcount} | [📂](${dlink}) |"
+                echo "| [${dname}](${REPO_URL}/tree/${BRANCH}/downloads/complete/${denc}) | ${dsize} | ${fcount} | [📂](${REPO_URL}/tree/${BRANCH}/downloads/complete/${denc}) |"
               done
+            else
+              echo ""
+              echo "_No files yet_"
             fi
             
             if [ -d "downloads/failed" ] && [ "$(ls -A downloads/failed 2>/dev/null)" ]; then
@@ -452,51 +542,48 @@ jobs:
               for dir in downloads/failed/*/; do
                 [ -d "$dir" ] || continue
                 dname=$(basename "$dir")
-                denc=$(echo "$dname" | sed 's/ /%20/g')
-                dlink="${REPO_URL}/tree/${BRANCH}/downloads/failed/${denc}"
-                echo "- [${dname}](${dlink})"
+                echo "- [${dname}](${REPO_URL}/tree/${BRANCH}/downloads/failed/$(echo $dname | sed 's/ /%20/g'))"
               done
             fi
             
             echo ""
             echo "---"
             echo ""
-            echo "### 🎯 How to Open (No Joining!)"
+            echo "### 🎯 How to Open Multi-Volume ZIP"
             echo ""
-            echo "| Platform | Do This |"
-            echo "|----------|---------|"
-            echo "| 📱 Android | Open **.zip.001** with ZArchiver |"
-            echo "| 📱 iOS | Open **.zip.001** with iZip |"
-            echo "| 🖥️ Windows | Right-click **.zip.001** → 7-Zip → Extract |"
-            echo "| 🍎 Mac | Double-click **.zip.001** |"
-            echo "| 🐧 Linux | \`7z x file.zip.001\` |"
+            echo "| Device | App | Action |"
+            echo "|--------|-----|--------|"
+            echo "| 📱 Android | ZArchiver | Open **.zip.001** |"
+            echo "| 📱 iOS | iZip | Open **.zip.001** |"
+            echo "| 🖥️ Windows | 7-Zip | Right-click **.zip.001** → Extract |"
+            echo "| 🍎 Mac | The Unarchiver | Double-click **.zip.001** |"
+            echo "| 🐧 Linux | p7zip | \`7z x file.zip.001\` |"
             echo ""
-            echo "**✨ Just open the first part! No cat, no join, no merge!**"
+            echo "**✨ Just open the FIRST part! No merging needed!**"
           } > downloads/README.md
           
           echo "✅ Report created"
 
-      - name: 💾 Commit and Push
+      - name: 💾 Save Files
         if: always()
         run: |
+          echo "Saving to repository..."
+          
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
           git add downloads/ 2>/dev/null || true
           
           if git diff --cached --quiet 2>/dev/null; then
-            echo "No changes"
+            echo "No changes to save"
             exit 0
           fi
           
-          git commit -m "📥 Download complete [skip ci]" || true
+          success_count=$(find downloads/complete -type f ! -name "README.md" 2>/dev/null | wc -l)
           
-          for i in 1 2 3; do
-            git pull --rebase origin "${{ github.ref_name }}" 2>/dev/null && break
-            sleep 5
-          done
+          git commit -m "📥 Downloaded ${success_count} files [skip ci]" 2>/dev/null || echo "Nothing to commit"
           
-          git push origin HEAD:"${{ github.ref_name }}" 2>/dev/null || echo "Will retry next run"
+          git push origin HEAD:"${{ github.ref_name }}" 2>/dev/null || echo "Push issue - will retry next run"
           
           echo "✅ Saved"
 
@@ -505,13 +592,11 @@ jobs:
         run: |
           echo ""
           echo "════════════════════════════════════════"
-          echo "   🎉 Done!"
+          echo "   🎉 Complete!"
           echo "════════════════════════════════════════"
           echo ""
           echo "📱 Open .zip.001 directly with:"
           echo "   • ZArchiver (Android)"
-          echo "   • iZip (iOS)"
+          echo "   • iZip (iOS)"  
           echo "   • 7-Zip (Windows)"
           echo "   • The Unarchiver (Mac)"
-          echo ""
-          echo "✨ No joining needed!"
