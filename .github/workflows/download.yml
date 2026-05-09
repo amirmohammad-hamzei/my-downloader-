@@ -1,4 +1,4 @@
-name: ⬇️ Download Manager v3
+name: ⬇️ Download Manager v4
 
 on:
   workflow_dispatch:
@@ -31,13 +31,20 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq aria2 zip unzip
           
-          # Clean start
-          rm -rf downloads
-          mkdir -p downloads
-          cd downloads
+          # Create unique folder for this batch with timestamp
+          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          BATCH_FOLDER="download_${TIMESTAMP}"
           
-          PROCESS_LOG="../process.log"
+          # Create base downloads folder if not exists
+          mkdir -p downloads
+          
+          # Create this batch's folder
+          mkdir -p "downloads/${BATCH_FOLDER}"
+          cd "downloads/${BATCH_FOLDER}"
+          
+          PROCESS_LOG="../process_${TIMESTAMP}.log"
           echo "Download started: $(date)" > "$PROCESS_LOG"
+          echo "Batch: ${BATCH_FOLDER}" >> "$PROCESS_LOG"
           
           count=0
           echo "$URLS" | while IFS= read -r url; do
@@ -79,45 +86,41 @@ jobs:
             size=$(stat -c%s "$filename")
             echo "✅ Downloaded: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
             
-            # Step 2: Pack as ZIP (ALWAYS - for consistency and splitting)
-            echo "📦 Creating ZIP archive..." | tee -a "$PROCESS_LOG"
-            ZIP_NAME="${base}.zip"
-            
-            # If file is already a zip, we might skip or rename. But to keep splitting logic universal, we wrap everything.
-            if [ "$ext" = "zip" ] || [ "$ext" = "ZIP" ]; then
-              # It's already a zip, just rename or keep for splitting
-              if [ "$filename" != "$ZIP_NAME" ]; then
-                mv "$filename" "$ZIP_NAME"
-                filename="$ZIP_NAME"
-              fi
-              echo "   File is already a ZIP" | tee -a "$PROCESS_LOG"
-            else
-              if [ -n "$PASSWORD" ]; then
-                zip -P "$PASSWORD" "$ZIP_NAME" "$filename" 2>/dev/null
+            # Step 2: Smart ZIP - Only if > 90MB
+            if [ "$size" -gt 94371840 ]; then
+              echo "📦 File > 90MB, creating ZIP..." | tee -a "$PROCESS_LOG"
+              ZIP_NAME="${base}.zip"
+              
+              if [ "$ext" = "zip" ] || [ "$ext" = "ZIP" ]; then
+                if [ "$filename" != "$ZIP_NAME" ]; then
+                  mv "$filename" "$ZIP_NAME"
+                  filename="$ZIP_NAME"
+                fi
+                echo "   File is already a ZIP" | tee -a "$PROCESS_LOG"
               else
-                zip "$ZIP_NAME" "$filename" 2>/dev/null
+                if [ -n "$PASSWORD" ]; then
+                  zip -P "$PASSWORD" "$ZIP_NAME" "$filename" 2>/dev/null
+                else
+                  zip "$ZIP_NAME" "$filename" 2>/dev/null
+                fi
+                
+                if [ -s "$ZIP_NAME" ]; then
+                  rm "$filename"
+                  filename="$ZIP_NAME"
+                  size=$(stat -c%s "$filename")
+                  echo "   ZIP created: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
+                else
+                  mv "$ZIP_NAME" "$filename" 2>/dev/null
+                  echo "   ZIP failed, keeping original" | tee -a "$PROCESS_LOG"
+                fi
               fi
               
-              if [ -s "$ZIP_NAME" ]; then
-                rm "$filename"
-                filename="$ZIP_NAME"
-                size=$(stat -c%s "$filename")
-                echo "   ZIP created: $((size / 1024 / 1024)) MB" | tee -a "$PROCESS_LOG"
-              else
-                # Zip failed, keep original
-                mv "$ZIP_NAME" "$filename" 2>/dev/null
-                echo "   ZIP failed, keeping original" | tee -a "$PROCESS_LOG"
-              fi
-            fi
-            
-            # Step 3: Split if > 90MB
-            if [ "$size" -gt 94371840 ]; then
+              # Step 3: Split the ZIP
               echo "✂️  Splitting into 90MB parts..." | tee -a "$PROCESS_LOG"
               
               PARTS_DIR="${base}_parts"
               mkdir -p "$PARTS_DIR"
               
-              # Move zip to parts dir and split
               mv "$filename" "$PARTS_DIR/"
               cd "$PARTS_DIR"
               
@@ -126,7 +129,6 @@ jobs:
               if [ $? -eq 0 ]; then
                 rm "$filename"
                 
-                # Rename parts
                 n=1
                 for part in part_*; do
                   new_name=$(printf "${base}.zip.%03d" $n)
@@ -138,14 +140,12 @@ jobs:
                 
                 echo "   Split into ${total} parts" | tee -a "$PROCESS_LOG"
                 
-                # Create Join Scripts
-                # Linux/Mac/Android (Termux)
+                # Join Scripts
                 echo "#!/bin/bash" > join.sh
                 echo "cat ${base}.zip.* > ../${base}.zip" >> join.sh
                 echo "echo 'Joined: ${base}.zip'" >> join.sh
                 chmod +x join.sh
                 
-                # Windows
                 echo "@echo off" > join.bat
                 echo "copy /b ${base}.zip.* ..\\${base}.zip" >> join.bat
                 echo "echo Joined: ${base}.zip" >> join.bat
@@ -153,50 +153,73 @@ jobs:
                 # README
                 echo "# 📦 Split ZIP Archive" > README.md
                 echo "" >> README.md
-                echo "**Original File:** ${filename}" >> README.md
+                echo "**Original File:** ${base}.zip" >> README.md
                 echo "**Parts:** ${total}" >> README.md
                 if [ -n "$PASSWORD" ]; then
-                  echo "**Password:** Yes (set by user)" >> README.md
+                  echo "**Password:** Yes" >> README.md
                 fi
                 echo "" >> README.md
                 echo "## 🔧 How to Join & Extract" >> README.md
                 echo "" >> README.md
                 echo "### 🖥️ Windows" >> README.md
                 echo "1. Run \`join.bat\`" >> README.md
-                echo "2. Extract the resulting \`${base}.zip\`" >> README.md
+                echo "2. Extract \`${base}.zip\` with 7-Zip or WinRAR" >> README.md
                 echo "" >> README.md
                 echo "### 🍎 Mac / 🐧 Linux" >> README.md
-                echo "Run in terminal:" >> README.md
                 echo "\`\`\`bash" >> README.md
                 echo "bash join.sh" >> README.md
-                echo "unzip ${base}.zip" >> README.md
+                if [ -n "$PASSWORD" ]; then
+                  echo "unzip -P 'YOUR_PASSWORD' ${base}.zip" >> README.md
+                else
+                  echo "unzip ${base}.zip" >> README.md
+                fi
                 echo "\`\`\`" >> README.md
                 echo "" >> README.md
-                echo "### 📱 Android" >> README.md
-                echo "1. Install **Termux**" >> README.md
-                echo "2. Navigate to this folder" >> README.md
-                echo "3. Run: \`cat ${base}.zip.* > ${base}.zip\`" >> README.md
-                echo "4. Open with **ZArchiver**" >> README.md
+                echo "### 📱 Android (Termux)" >> README.md
+                echo "\`\`\`bash" >> README.md
+                echo "cat ${base}.zip.* > ${base}.zip" >> README.md
+                echo "# Then open with ZArchiver" >> README.md
+                echo "\`\`\`" >> README.md
               else
                 echo "❌ Split failed" | tee -a "$PROCESS_LOG"
                 mv "$filename" ../
               fi
               
               cd ..
+            else
+              # File <= 90MB: keep original, no ZIP
+              echo "📄 File <= 90MB, keeping original format" | tee -a "$PROCESS_LOG"
             fi
             
             echo "✅ Completed: $filename" | tee -a "$PROCESS_LOG"
             echo "" >> "$PROCESS_LOG"
           done
           
-          # Main README
-          echo "# 📥 Downloaded Files" > README.md
+          # Batch README
+          echo "# 📥 Download Batch: ${TIMESTAMP}" > README.md
           echo "" >> README.md
-          echo "Date: $(date)" >> README.md
+          echo "**Date:** $(date)" >> README.md
+          echo "**Password:** $([ -n "$PASSWORD" ] && echo 'Yes' || echo 'No')" >> README.md
           echo "" >> README.md
-          echo "## Files" >> README.md
+          echo "## 📁 Files in this batch" >> README.md
           echo "" >> README.md
-          find . -type f \( -name "*.zip" -o -name "*.part*" -o -name "*.zip.*" \) -exec ls -lh {} \; >> README.md 2>/dev/null
+          find . -type f -not -name "README.md" -not -name "join.sh" -not -name "join.bat" -exec ls -lh {} \; >> README.md 2>/dev/null
+          
+          # Main downloads README (update with all batches)
+          cd ../..
+          echo "# 📥 All Downloads" > downloads/README.md
+          echo "" >> downloads/README.md
+          echo "**Last update:** $(date)" >> downloads/README.md
+          echo "" >> downloads/README.md
+          echo "## 📂 Download Batches" >> downloads/README.md
+          echo "" >> downloads/README.md
+          for folder in downloads/download_*; do
+            if [ -d "$folder" ]; then
+              folder_name=$(basename "$folder")
+              file_count=$(find "$folder" -type f -not -name "README.md" | wc -l)
+              echo "- **[$folder_name]($folder_name/)** - $file_count files" >> downloads/README.md
+            fi
+          done
           
           cd ..
 
@@ -215,19 +238,34 @@ jobs:
             exit 0
           fi
           
-          git commit -m "📥 Download complete [skip ci]"
+          git commit -m "📥 Download batch $(date +%Y-%m-%d_%H-%M-%S) [skip ci]"
           
           echo "Pushing..."
           git pull --rebase origin ${{ github.ref_name }} 2>/dev/null || true
           git push origin HEAD:${{ github.ref_name }}
           
-          echo "Done!"
-          echo "Download from: ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
+          echo ""
+          echo "=============================="
+          echo " ✅ DONE!"
+          echo "=============================="
+          echo "📁 Your files:"
+          echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
 
       - name: Show Results
         run: |
           echo ""
           echo "=============================="
-          echo " LINKS TO YOUR FILES"
+          echo " 📥 DOWNLOAD LINKS"
           echo "=============================="
+          echo ""
+          echo "🔗 Main folder:"
           echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/downloads"
+          echo ""
+          echo "📂 Latest batch:"
+          LATEST=$(ls -td downloads/download_* 2>/dev/null | head -1)
+          if [ -n "$LATEST" ]; then
+            echo "${{ github.server_url }}/${{ github.repository }}/tree/${{ github.ref_name }}/${LATEST}"
+            echo ""
+            echo "📁 Contents:"
+            find "$LATEST" -type f -not -name "README.md" -not -name "join.sh" -not -name "join.bat" -exec ls -lh {} \;
+          fi
