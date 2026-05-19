@@ -34,7 +34,7 @@ jobs:
           URLS: ${{ github.event.inputs.urls }}
           PASSWORD: ${{ github.event.inputs.password }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
-          BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          BALE_BOT_TOKEN: ${{ vars.BALE_BOT_TOKEN }}
         run: |
           # Create temp directory
           TEMP_DIR=$(mktemp -d)
