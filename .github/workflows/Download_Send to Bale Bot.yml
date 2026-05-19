@@ -45,38 +45,73 @@ jobs:
           
           echo "Temp directory: $TEMP_DIR"
           echo "Chat ID: $CHAT_ID"
+          echo "Bot Token: ${BALE_BOT_TOKEN:0:10}..."
           
-          # Function to send file to Bale
-          send_file() {
-            local file="$1"
+          # Function to send message
+          send_msg() {
+            local text="$1"
+            echo "Sending message: $text"
+            local response=$(curl -s -w "\n%{http_code}" -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendMessage" \
+              -F "chat_id=${CHAT_ID}" \
+              -F "text=${text}")
+            echo "Message API Response: $response"
+          }
+          
+          # Function to send document  
+          send_document() {
+            local file_path="$1"
             local caption="$2"
             
-            echo "Sending: $file ($(ls -lh "$file" | awk '{print $5}'))"
+            if [ ! -f "$file_path" ]; then
+              echo "ERROR: File not found: $file_path"
+              return 1
+            fi
             
-            response=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendDocument" \
+            local file_size=$(stat -c%s "$file_path")
+            local file_name=$(basename "$file_path")
+            
+            echo "========================================="
+            echo "Sending document: $file_name"
+            echo "File path: $file_path"
+            echo "File size: $file_size bytes ($((file_size / 1024 / 1024)) MB)"
+            echo "Caption: $caption"
+            echo "========================================="
+            
+            # Try sending with verbose output
+            local response=$(curl -v -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendDocument" \
               -F "chat_id=${CHAT_ID}" \
-              -F "document=@${file}" \
-              -F "caption=${caption}")
+              -F "document=@${file_path};filename=${file_name}" \
+              -F "caption=${caption}" 2>&1)
             
+            echo "Full response:"
+            echo "$response"
+            echo "========================================="
+            
+            # Check if successful
             if echo "$response" | grep -q '"ok":true'; then
-              echo "  ✓ Sent successfully"
+              echo "✓ File sent successfully!"
               return 0
+            elif echo "$response" | grep -q '"ok":false'; then
+              echo "✗ API Error:"
+              echo "$response" | grep -o '"description":"[^"]*"'
+              return 1
             else
-              echo "  ✗ Failed: $response"
+              echo "✗ Unknown error"
               return 1
             fi
           }
           
-          # Function to send message
-          send_msg() {
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendMessage" \
-              -F "chat_id=${CHAT_ID}" \
-              -F "text=$1" > /dev/null 2>&1
-          }
+          # Test: Create and send a small test file first
+          echo "Creating test file..."
+          echo "This is a test file from GitHub Actions" > test.txt
+          echo "Date: $(date)" >> test.txt
           
-          # Start
-          send_msg "🚀 شروع دانلود فایل ها..."
-          echo "Started"
+          echo "Testing file send..."
+          send_document "test.txt" "Test file from GitHub Actions"
+          
+          echo ""
+          echo "Now processing URLs..."
+          send_msg "🚀 شروع دانلود و ارسال فایل‌ها..."
           
           # Save URLs
           echo "$URLS" > urls.txt
@@ -87,23 +122,23 @@ jobs:
             count=$((count + 1))
             
             echo ""
-            echo "=== File $count ==="
-            echo "URL: $url"
+            echo "========================================="
+            echo "Processing URL $count: $url"
             
-            # Get filename from URL
+            # Get filename
             filename=$(basename "$url" | cut -d'?' -f1 | cut -d'#' -f1 | sed 's/%20/_/g')
             [ -z "$filename" ] && filename="file_${count}.bin"
             
-            echo "Name: $filename"
+            echo "Target filename: $filename"
             send_msg "📥 [$count] دانلود: $filename"
             
-            # Download with aria2c
+            # Download
             echo "Downloading..."
-            if ! aria2c -x4 -s4 --max-tries=5 --timeout=120 --dir="." --out="$filename" "$url"; then
+            if ! aria2c -x4 -s4 --max-tries=5 --timeout=120 --dir="." --out="$filename" "$url" 2>&1; then
               echo "aria2c failed, trying wget..."
-              if ! wget -q --tries=5 --timeout=60 -U "Mozilla/5.0" -O "$filename" "$url"; then
+              if ! wget -v --tries=5 --timeout=60 -U "Mozilla/5.0" -O "$filename" "$url" 2>&1; then
                 echo "wget failed, trying curl..."
-                if ! curl -L --retry 5 --connect-timeout 30 -A "Mozilla/5.0" -o "$filename" "$url"; then
+                if ! curl -L -v --retry 5 --connect-timeout 30 -A "Mozilla/5.0" -o "$filename" "$url" 2>&1; then
                   echo "All methods failed!"
                   send_msg "❌ خطا در دانلود $filename"
                   continue
@@ -111,124 +146,85 @@ jobs:
               fi
             fi
             
-            # Check download
-            if [ ! -f "$filename" ] || [ ! -s "$filename" ]; then
-              echo "Download failed - file empty or missing"
-              send_msg "❌ فایل خالی است: $filename"
+            # Check if file exists
+            if [ ! -f "$filename" ]; then
+              echo "ERROR: File not created: $filename"
               continue
             fi
             
-            # Get size
             size=$(stat -c%s "$filename")
             size_mb=$((size / 1048576))
-            echo "Size: $size_mb MB"
+            echo "Downloaded: $filename ($size_mb MB)"
+            
             send_msg "✅ دانلود شد: $filename (${size_mb}MB)"
             
-            # If file is 50MB or less, send directly
+            # Send directly if <= 50MB
             if [ "$size" -le 52428800 ]; then
-              echo "Sending directly (under 50MB)..."
-              send_file "$filename" "📁 $filename" || send_msg "⚠️ خطا در ارسال فایل"
-              continue
-            fi
-            
-            # For files > 50MB, create parts
-            echo "File > 50MB, splitting..."
-            
-            base=$(echo "$filename" | sed 's/\.[^.]*$//')
-            ext=$(echo "$filename" | awk -F. '{print tolower($NF)}')
-            
-            # If not zip, compress it first
-            if [ "$ext" != "zip" ]; then
-              echo "Compressing to ZIP..."
-              zipfile="${base}.zip"
+              echo "Sending file directly..."
+              send_document "$filename" "$filename"
+            else
+              # For large files, split first
+              echo "File too large, splitting..."
               
-              if [ -n "$PASSWORD" ]; then
-                zip -P "$PASSWORD" -9 "$zipfile" "$filename"
-              else
-                zip -9 "$zipfile" "$filename"
+              base="${filename%.*}"
+              ext="${filename##*.}"
+              
+              # Create zip if not already
+              if [ "$ext" != "zip" ]; then
+                zipfile="${base}.zip"
+                echo "Creating zip: $zipfile"
+                
+                if [ -n "$PASSWORD" ]; then
+                  zip -P "$PASSWORD" "$zipfile" "$filename"
+                else
+                  zip "$zipfile" "$filename"
+                fi
+                
+                if [ -f "$zipfile" ]; then
+                  rm "$filename"
+                  filename="$zipfile"
+                fi
               fi
               
-              if [ -f "$zipfile" ] && [ -s "$zipfile" ]; then
-                echo "Compressed: $(ls -lh "$zipfile" | awk '{print $5}')"
-                rm -f "$filename"
-                filename="$zipfile"
-              else
-                echo "Compression failed!"
-                send_msg "⚠️ خطا در فشرده‌سازی"
-                continue
+              # Split into 45MB parts
+              echo "Splitting $filename..."
+              split_prefix="${base}_part_"
+              split -b 45M -d "$filename" "$split_prefix"
+              
+              if [ $? -eq 0 ]; then
+                rm "$filename"
+                
+                part=1
+                for partfile in ${split_prefix}*; do
+                  if [ -f "$partfile" ]; then
+                    newname=$(printf "%s.%03d" "$base" $part)
+                    mv "$partfile" "$newname"
+                    
+                    part_size=$(stat -c%s "$newname")
+                    echo "Sending part $part: $newname ($((part_size / 1024 / 1024)) MB)"
+                    
+                    send_document "$newname" "📦 ${base} - بخش ${part}"
+                    part=$((part + 1))
+                  fi
+                done
+                
+                total=$((part - 1))
+                send_msg "📋 فایل به ${total} بخش تقسیم و ارسال شد"
               fi
             fi
             
-            # Now split the zip file
-            partdir="split_${base}_$$"
-            mkdir -p "$partdir"
-            
-            echo "Splitting $filename..."
-            cp "$filename" "$partdir/"
-            cd "$partdir"
-            
-            # Use split command
-            split -b 45M -d "$filename" "${base}.part"
-            
-            if [ ! -f "${base}.part00" ]; then
-              echo "Split failed!"
-              cd ..
-              send_msg "⚠️ خطا در تقسیم فایل"
-              continue
-            fi
-            
-            # Remove original zip from parts dir
-            rm -f "$filename"
-            
-            # Rename parts with proper names
-            part_num=1
-            for part in ${base}.part*; do
-              [ ! -f "$part" ] && continue
-              
-              newname=$(printf "%s.zip.%03d" "$base" $part_num)
-              mv "$part" "$newname"
-              
-              echo "Part $part_num: $newname ($(ls -lh "$newname" | awk '{print $5}'))"
-              
-              # Send this part
-              if send_file "$newname" "📦 ${base} - بخش ${part_num}"; then
-                echo "  Part $part_num sent"
-              else
-                echo "  Failed to send part $part_num"
-              fi
-              
-              part_num=$((part_num + 1))
-            done
-            
-            total=$((part_num - 1))
-            echo "Total parts: $total"
-            
-            # Send join instructions
-            msg="📋 فایل ${base} به ${total} بخش تقسیم شد"
-            msg="${msg}"$'\n'"⚠️ برای استفاده:"
-            msg="${msg}"$'\n'"۱. همه فایل‌ها را دانلود کنید"
-            msg="${msg}"$'\n'"۲. در یک پوشه قرار دهید"
-            msg="${msg}"$'\n'"۳. با دستور زیر متصل کنید:"
-            msg="${msg}"$'\n'"cat ${base}.zip.* > ${base}.zip"
-            msg="${msg}"$'\n'"۴. فایل ${base}.zip را Extract کنید"
-            send_msg "$msg"
-            
-            if [ -n "$PASSWORD" ]; then
-              send_msg "🔐 رمز فایل: ${PASSWORD}"
-            fi
-            
-            cd "$TEMP_DIR"
+            echo "Completed: $filename"
             
           done < urls.txt
           
-          # Done
+          send_msg "✅ عملیات به پایان رسید"
           if [ -n "$PASSWORD" ]; then
-            send_msg "✅ تمام شد! 🔐 رمز: ${PASSWORD}"
-          else
-            send_msg "✅ تمام شد!"
+            send_msg "🔐 رمز: ${PASSWORD}"
           fi
           
-          # Cleanup
-          cd /
-          rm -rf "$TEMP_DIR"
+          # Keep files for debugging
+          echo ""
+          echo "Files in temp directory:"
+          ls -lah "$TEMP_DIR"
+          
           echo "Done!"
