@@ -39,8 +39,6 @@ jobs:
           CHAT_ID: ${{ github.event.inputs.chat_id }}
           BALE_BOT_TOKEN: ${{ github.event.inputs.bot_token }}
         run: |
-          set -e  # Exit on error
-          
           # Create temp directory
           TEMP_DIR=$(mktemp -d)
           cd "$TEMP_DIR" || exit 1
@@ -50,9 +48,16 @@ jobs:
           
           # Function to send message
           send_message() {
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendMessage" \
+            local response=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendMessage" \
               -F "chat_id=${CHAT_ID}" \
-              -F "text=$1" || true
+              -F "text=$1")
+            
+            echo "Message response: $response"
+            
+            if echo "$response" | grep -q '"ok":false'; then
+              echo "WARNING: Cannot send message. Bot might be blocked."
+              echo "Please unblock the bot and try again."
+            fi
           }
           
           # Function to send document
@@ -60,20 +65,35 @@ jobs:
             local file_path="$1"
             local caption="$2"
             
-            echo "Sending file: $file_path"
+            echo "Sending file: $file_path (Size: $(stat -c%s "$file_path" 2>/dev/null || echo 0) bytes)"
             
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendDocument" \
+            local response=$(curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendDocument" \
               -F "chat_id=${CHAT_ID}" \
               -F "document=@${file_path}" \
-              -F "caption=${caption}" || {
-              echo "Failed to send document, trying alternative method..."
+              -F "caption=${caption}")
+            
+            echo "Document response: $response"
+            
+            if echo "$response" | grep -q '"ok":true'; then
+              return 0
+            else
               return 1
-            }
-            return 0
+            fi
           }
           
-          # Send start notification
-          send_message "شروع دانلود فایل ها..."
+          # Test bot connection first
+          echo "Testing bot connection..."
+          TEST_RESPONSE=$(curl -s "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/getMe")
+          echo "Bot info: $TEST_RESPONSE"
+          
+          if echo "$TEST_RESPONSE" | grep -q '"ok":true'; then
+            echo "Bot connection OK"
+          else
+            echo "ERROR: Cannot connect to bot. Check token."
+          fi
+          
+          # Send start notification (ignore if blocked)
+          send_message "شروع دانلود فایل ها..." || true
           
           # Process URLs
           echo "$URLS" > urls.txt
@@ -84,6 +104,8 @@ jobs:
             [ -z "$url" ] && continue
             
             count=$((count + 1))
+            echo ""
+            echo "========================================="
             echo "Processing URL $count: $url"
             
             # Extract filename
@@ -96,31 +118,46 @@ jobs:
             filename=$(echo "$filename" | sed 's/%20/_/g' | sed 's/[^a-zA-Z0-9._-]/_/g')
             
             echo "Filename: $filename"
-            send_message "شروع دانلود: $filename"
+            send_message "شروع دانلود: $filename" || true
             
             # Download with multiple methods
             downloaded=false
             
             # Method 1: aria2c
             echo "Trying aria2c..."
-            aria2c -x4 -s4 --max-tries=3 --timeout=60 \
-              --dir="." --out="$filename" "$url" 2>&1 && [ -f "$filename" ] && [ -s "$filename" ] && downloaded=true
+            if aria2c -x4 -s4 --max-tries=3 --timeout=120 \
+              --dir="." --out="$filename" "$url" 2>&1; then
+              if [ -f "$filename" ] && [ -s "$filename" ]; then
+                downloaded=true
+                echo "Downloaded with aria2c"
+              fi
+            fi
             
             # Method 2: wget
             if [ "$downloaded" = false ]; then
               echo "Trying wget..."
-              wget --tries=3 --timeout=30 -U "Mozilla/5.0" -O "$filename" "$url" 2>&1 && [ -f "$filename" ] && [ -s "$filename" ] && downloaded=true
+              if wget --tries=3 --timeout=60 -U "Mozilla/5.0" -O "$filename" "$url" 2>&1; then
+                if [ -f "$filename" ] && [ -s "$filename" ]; then
+                  downloaded=true
+                  echo "Downloaded with wget"
+                fi
+              fi
             fi
             
             # Method 3: curl
             if [ "$downloaded" = false ]; then
               echo "Trying curl..."
-              curl -L --retry 3 --connect-timeout 30 -A "Mozilla/5.0" -o "$filename" "$url" 2>&1 && [ -f "$filename" ] && [ -s "$filename" ] && downloaded=true
+              if curl -L --retry 3 --connect-timeout 30 -A "Mozilla/5.0" -o "$filename" "$url" 2>&1; then
+                if [ -f "$filename" ] && [ -s "$filename" ]; then
+                  downloaded=true
+                  echo "Downloaded with curl"
+                fi
+              fi
             fi
             
-            if [ "$downloaded" = false ]; then
-              echo "Failed to download: $filename"
-              send_message "خطا در دانلود: $filename"
+            if [ "$downloaded" = false ] || [ ! -f "$filename" ]; then
+              echo "ERROR: Failed to download: $filename"
+              send_message "خطا در دانلود: $filename" || true
               continue
             fi
             
@@ -129,63 +166,119 @@ jobs:
             size_mb=$((size / 1048576))
             echo "Downloaded: $size_mb MB"
             
-            send_message "دانلود شد: $filename ($size_mb MB)"
+            # Check file extension
+            extension="${filename##*.}"
+            extension_lower=$(echo "$extension" | tr '[:upper:]' '[:lower:]')
             
-            # Send file if under 50MB
+            send_message "دانلود شد: $filename ($size_mb MB)" || true
+            
+            # Handle based on file type and size
             if [ "$size" -le 52428800 ]; then
-              echo "Sending file directly..."
-              send_document "$filename" "فایل: $filename"
-            else
-              echo "File too large, creating ZIP parts..."
+              # File under 50MB - send directly
+              echo "File under 50MB, sending directly..."
+              send_document "$filename" "فایل: $filename" || echo "Failed to send file"
               
-              # Create ZIP
+            elif [ "$extension_lower" = "zip" ]; then
+              # Already a ZIP file - just split and send
+              echo "File is already ZIP, splitting into parts..."
+              
+              parts_dir="parts_${filename%.*}"
+              mkdir -p "$parts_dir"
+              cp "$filename" "$parts_dir/"
+              cd "$parts_dir"
+              
+              base="${filename%.*}"
+              
+              # Split the ZIP file
+              split -b 45000000 -d "$filename" "part_"
+              
+              if [ $? -eq 0 ] && [ -f "part_00" ]; then
+                rm -f "$filename"
+                
+                # Rename and send parts
+                part_num=1
+                for part in part_*; do
+                  if [ -f "$part" ]; then
+                    new_name=$(printf "%s.zip.%03d" "$base" $part_num)
+                    mv "$part" "$new_name"
+                    
+                    echo "Sending part $part_num: $new_name"
+                    send_document "$new_name" "بخش $part_num - $base" || echo "Failed to send part $part_num"
+                    
+                    part_num=$((part_num + 1))
+                  fi
+                done
+                
+                total_parts=$((part_num - 1))
+                echo "Split complete: $total_parts parts"
+                send_message "فایل به $total_parts بخش تقسیم شد. برای اتصال: cat ${base}.zip.* > ${base}.zip" || true
+              else
+                echo "Split failed"
+                send_message "خطا در تقسیم فایل" || true
+              fi
+              
+              cd "$TEMP_DIR"
+              
+            else
+              # Not a ZIP - compress then split
+              echo "Compressing file..."
+              
               base="${filename%.*}"
               zip_name="${base}.zip"
               
               if [ -n "$PASSWORD" ]; then
-                zip -P "$PASSWORD" "$zip_name" "$filename" 2>/dev/null || true
+                zip -P "$PASSWORD" -9 "$zip_name" "$filename" 2>/dev/null
               else
-                zip "$zip_name" "$filename" 2>/dev/null || true
+                zip -9 "$zip_name" "$filename" 2>/dev/null
               fi
               
               if [ -f "$zip_name" ] && [ -s "$zip_name" ]; then
                 rm -f "$filename"
                 
-                # Split into parts
-                parts_dir="parts_${base}"
-                mkdir -p "$parts_dir"
-                mv "$zip_name" "$parts_dir/"
-                cd "$parts_dir"
+                # Check compressed size
+                zip_size=$(stat -c%s "$zip_name")
+                zip_size_mb=$((zip_size / 1048576))
+                echo "Compressed: $zip_size_mb MB"
                 
-                split -b 45000000 -d "$zip_name" "part_" || {
-                  echo "Split failed, trying to send whole file"
-                  cd ..
-                  send_document "$parts_dir/$zip_name" "فایل فشرده: $zip_name"
-                  continue
-                }
-                
-                rm -f "$zip_name"
-                
-                # Rename and send parts
-                part_num=1
-                for part in part_*; do
-                  new_name=$(printf "%s.zip.%03d" "$base" $part_num)
-                  mv "$part" "$new_name"
+                if [ "$zip_size" -le 52428800 ]; then
+                  # Compressed file fits - send directly
+                  send_document "$zip_name" "فایل فشرده: $zip_name" || echo "Failed to send compressed file"
+                else
+                  # Still too large - split
+                  echo "Splitting compressed file..."
                   
-                  echo "Sending part $part_num: $new_name"
-                  send_document "$new_name" "بخش $part_num - $base"
+                  parts_dir="parts_${base}"
+                  mkdir -p "$parts_dir"
+                  mv "$zip_name" "$parts_dir/"
+                  cd "$parts_dir"
                   
-                  part_num=$((part_num + 1))
-                done
-                
-                # Send join instructions
-                total_parts=$((part_num - 1))
-                send_message "برای اتصال فایل ها از دستور زیر استفاده کنید: cat ${base}.zip.* > ${base}.zip"
-                
-                cd ..
+                  split -b 45000000 -d "$zip_name" "part_"
+                  
+                  if [ $? -eq 0 ] && [ -f "part_00" ]; then
+                    rm -f "$zip_name"
+                    
+                    part_num=1
+                    for part in part_*; do
+                      if [ -f "$part" ]; then
+                        new_name=$(printf "%s.zip.%03d" "$base" $part_num)
+                        mv "$part" "$new_name"
+                        
+                        echo "Sending part $part_num: $new_name"
+                        send_document "$new_name" "بخش $part_num - $base" || echo "Failed to send part $part_num"
+                        
+                        part_num=$((part_num + 1))
+                      fi
+                    done
+                    
+                    total_parts=$((part_num - 1))
+                    send_message "فایل به $total_parts بخش تقسیم شد" || true
+                  fi
+                  
+                  cd "$TEMP_DIR"
+                fi
               else
-                echo "ZIP creation failed"
-                send_message "خطا در فشرده سازی فایل"
+                echo "Compression failed, trying to send original file..."
+                send_document "$filename" "فایل اصلی: $filename" || echo "Failed to send file"
               fi
             fi
             
@@ -199,16 +292,19 @@ jobs:
             password_info="رمز فایل: $PASSWORD"
           fi
           
-          send_message "عملیات دانلود به پایان رسید. $password_info"
+          send_message "عملیات دانلود به پایان رسید. $password_info" || true
           
           # Cleanup
           cd /
           rm -rf "$TEMP_DIR"
           
+          echo ""
+          echo "=============================="
           echo "All done!"
+          echo "=============================="
           
       - name: Check Status
         if: always()
         run: |
           echo "Workflow finished"
-          echo "Check your Bale messages"
+          echo "If bot is blocked, unblock it first then re-run"
