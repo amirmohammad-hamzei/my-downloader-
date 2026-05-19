@@ -95,6 +95,7 @@ jobs:
             echo "========================================="
             echo "File $count: $url"
             
+            # Get original filename from URL
             filename=$(basename "$url" | cut -d'?' -f1 | cut -d'#' -f1 | sed 's/%20/_/g')
             [ -z "$filename" ] && filename="file_${count}.bin"
             
@@ -123,60 +124,64 @@ jobs:
             echo "Size: $size_mb MB"
             send_msg "✅ ${size_mb}MB - $filename"
             
+            # Always use .zip extension for consistency
+            base=$(echo "$filename" | sed 's/\.[^.]*$//')
+            ext=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
+            
+            # If not already a zip, convert to zip
+            if [ "$ext" != "zip" ]; then
+              echo "Converting to ZIP..."
+              zipfile="${base}.zip"
+              
+              if [ -n "$PASSWORD" ]; then
+                zip -q -P "$PASSWORD" -9 "$zipfile" "$filename"
+              else
+                zip -q -9 "$zipfile" "$filename"
+              fi
+              
+              if [ -f "$zipfile" ] && [ -s "$zipfile" ]; then
+                rm "$filename"
+                filename="$zipfile"
+                size=$(stat -c%s "$filename")
+                size_mb=$((size / 1048576))
+                echo "ZIP created: $size_mb MB"
+              else
+                echo "ZIP failed - keeping original format"
+              fi
+            fi
+            
+            # Split if > 19MB
             if [ "$size" -gt "$CHUNK_SIZE" ]; then
               echo "File > 19MB, splitting..."
               
-              base="${filename%.*}"
-              ext=$(echo "${filename##*.}" | tr '[:upper:]' '[:lower:]')
-              
-              if [ "$ext" != "zip" ]; then
-                echo "Creating zip..."
-                zipfile="${base}.zip"
-                
-                if [ -n "$PASSWORD" ]; then
-                  zip -q -P "$PASSWORD" -9 "$zipfile" "$filename"
-                else
-                  zip -q -9 "$zipfile" "$filename"
-                fi
-                
-                if [ -f "$zipfile" ] && [ -s "$zipfile" ]; then
-                  rm "$filename"
-                  filename="$zipfile"
-                  echo "ZIP created"
-                else
-                  echo "ZIP failed!"
-                  send_msg "⚠️ خطا در فشرده‌سازی"
-                  continue
-                fi
-              fi
-              
-              echo "Splitting..."
-              splitdir="parts_${base}_$$"
+              splitdir="split_${base}_$$"
               mkdir -p "$splitdir"
-              mv "$filename" "$splitdir/"
+              cp "$filename" "$splitdir/"
               cd "$splitdir"
               
-              split -b $CHUNK_SIZE -d "$filename" "chunk_"
+              split -b $CHUNK_SIZE -d "$filename" "temp_chunk_"
               
-              if [ $? -eq 0 ] && ls chunk_* >/dev/null 2>&1; then
+              if [ $? -eq 0 ] && ls temp_chunk_* >/dev/null 2>&1; then
                 rm "$filename"
                 
-                total=$(ls chunk_* | wc -l)
-                echo "Created $total parts"
+                total=$(ls temp_chunk_* | wc -l)
+                echo "Split into $total parts"
                 
                 part=1
-                for chunk in chunk_*; do
+                for chunk in temp_chunk_*; do
                   [ ! -f "$chunk" ] && continue
                   
-                  partname=$(printf "%s.%03d" "$base" $part)
+                  # Rename to .zip.001, .zip.002, etc.
+                  partname=$(printf "%s.zip.%03d" "$base" $part)
                   mv "$chunk" "$partname"
                   
                   part_size=$(stat -c%s "$partname")
                   echo "Part $part/$total: $partname ($((part_size / 1024 / 1024)) MB)"
                   
+                  # Send with retry
                   retry=0
                   while [ $retry -lt 3 ]; do
-                    if send_document "$partname" "📦 ${base} [${part}/${total}]"; then
+                    if send_document "$partname" "📦 ${base}.zip - بخش ${part} از ${total}"; then
                       break
                     fi
                     retry=$((retry + 1))
@@ -187,12 +192,18 @@ jobs:
                   part=$((part + 1))
                 done
                 
-                join_msg="📋 فایل ${base} - ${total} بخش"
-                join_msg="$join_msg"$'\n'"🔧 برای اتصال: cat ${base}.* > ${base}.zip"
+                # Instructions for joining
+                join_msg="📋 فایل ${base}.zip به ${total} بخش تقسیم شد"
                 send_msg "$join_msg"
                 
+                join_cmd="🔧 روش اتصال فایل‌ها:"
+                join_cmd="$join_cmd"$'\n'"Windows: copy /b ${base}.zip.* ${base}.zip"
+                join_cmd="$join_cmd"$'\n'"Linux/Mac: cat ${base}.zip.* > ${base}.zip"
+                join_cmd="$join_cmd"$'\n'"Android: با ZArchiver اولین فایل رو Extract کن"
+                send_msg "$join_cmd"
+                
                 if [ -n "$PASSWORD" ]; then
-                  send_msg "🔐 رمز: ${PASSWORD}"
+                  send_msg "🔐 رمز فایل ZIP: ${PASSWORD}"
                 fi
                 
               else
@@ -203,8 +214,15 @@ jobs:
               cd "$TEMP_DIR"
               
             else
+              # File < 19MB - send directly
               echo "Sending directly..."
-              if send_document "$filename" "📁 $filename"; then
+              
+              # Make sure it has .zip extension
+              if [ "$ext" != "zip" ] && [ -f "${base}.zip" ]; then
+                filename="${base}.zip"
+              fi
+              
+              if send_document "$filename" "📁 $(basename "$filename")"; then
                 echo "Sent successfully!"
               else
                 echo "Send failed!"
@@ -214,11 +232,14 @@ jobs:
             
           done < urls.txt
           
-          send_msg "✅ عملیات به پایان رسید"
+          # Final messages
+          send_msg "✅ عملیات دانلود و ارسال به پایان رسید"
+          
           if [ -n "$PASSWORD" ]; then
-            send_msg "🔐 رمز فایل‌ها: ${PASSWORD}"
+            send_msg "🔐 رمز همه فایل‌های ZIP: ${PASSWORD}"
           fi
           
+          # Cleanup
           cd /
           rm -rf "$TEMP_DIR"
-          echo "Done!"
+          echo "All done!"
