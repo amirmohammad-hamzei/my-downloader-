@@ -1,19 +1,23 @@
-name: ⬇️ Download Manager - Send to Bale Bot
+name: Download Manager - Send to Bale Bot
 
 on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'لینک های دانلود (هر خط یک لینک)'
+        description: 'دانلود لینک (هر خط یک لینک)'
         required: true
         type: string
       password:
-        description: 'رمز فایل ZIP (اختیاری - خالی بذارید بدون رمز باشه)'
+        description: 'رمز فایل ZIP (اختیاری)'
         required: false
         default: ''
         type: string
       chat_id:
-        description: 'Chat ID ربات بله (عددی)'
+        description: 'Chat ID ربات بله'
+        required: true
+        type: string
+      bot_token:
+        description: 'توکن ربات بله'
         required: true
         type: string
 
@@ -26,262 +30,185 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 zip unzip curl jq python3 python3-pip
-          pip3 install requests
+          sudo apt-get install -y -qq aria2 zip unzip curl jq
 
       - name: Download and Send to Bale Bot
         env:
           URLS: ${{ github.event.inputs.urls }}
           PASSWORD: ${{ github.event.inputs.password }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
-          BALE_BOT_TOKEN: ${{ vars.BALE_BOT_TOKEN }}
+          BALE_BOT_TOKEN: ${{ github.event.inputs.bot_token }}
         run: |
+          set -e  # Exit on error
+          
           # Create temp directory
           TEMP_DIR=$(mktemp -d)
-          cd "$TEMP_DIR"
+          cd "$TEMP_DIR" || exit 1
           
-          echo "Starting downloads..."
-          
-          # Function to send file to Bale bot
-          send_to_bale() {
-            local file="$1"
-            local caption="$2"
-            local chat_id="$3"
-            local token="$4"
-            
-            echo "Sending: $(basename "$file")"
-            
-            BALE_API="https://tapi.bale.ai/bot${token}"
-            
-            FILE_SIZE=$(stat -c%s "$file")
-            MAX_SIZE=$((50 * 1024 * 1024))
-            
-            if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
-              echo "File too large for direct send: $((FILE_SIZE / 1024 / 1024))MB"
-              return 1
-            fi
-            
-            response=$(curl -s -X POST "${BALE_API}/sendDocument" \
-              -F "chat_id=${chat_id}" \
-              -F "document=@${file}" \
-              -F "caption=${caption}")
-            
-            if echo "$response" | jq -e '.ok' > /dev/null 2>&1; then
-              echo "Sent successfully"
-              return 0
-            else
-              echo "Failed to send"
-              echo "Response: $response"
-              return 1
-            fi
-          }
+          echo "Temp directory: $TEMP_DIR"
+          echo "Chat ID: $CHAT_ID"
           
           # Function to send message
           send_message() {
-            local text="$1"
-            local chat_id="$2"
-            local token="$3"
-            
-            BALE_API="https://tapi.bale.ai/bot${token}"
-            
-            curl -s -X POST "${BALE_API}/sendMessage" \
-              -F "chat_id=${chat_id}" \
-              -F "text=${text}" > /dev/null
+            curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendMessage" \
+              -F "chat_id=${CHAT_ID}" \
+              -F "text=$1" || true
           }
           
-          # Send start message
-          send_message "Starting download and file transfer..." "$CHAT_ID" "$BALE_BOT_TOKEN"
+          # Function to send document
+          send_document() {
+            local file_path="$1"
+            local caption="$2"
+            
+            echo "Sending file: $file_path"
+            
+            curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/sendDocument" \
+              -F "chat_id=${CHAT_ID}" \
+              -F "document=@${file_path}" \
+              -F "caption=${caption}" || {
+              echo "Failed to send document, trying alternative method..."
+              return 1
+            }
+            return 0
+          }
+          
+          # Send start notification
+          send_message "شروع دانلود فایل ها..."
+          
+          # Process URLs
+          echo "$URLS" > urls.txt
           
           count=0
-          success_count=0
-          fail_count=0
-          
-          echo "$URLS" | while IFS= read -r url; do
+          while IFS= read -r url; do
+            # Skip empty lines
             [ -z "$url" ] && continue
+            
             count=$((count + 1))
+            echo "Processing URL $count: $url"
             
-            filename=$(basename "$url" | cut -d'?' -f1 | cut -d'#' -f1 | sed 's/%20/_/g')
-            [ -z "$filename" ] && filename="download_${count}.bin"
-            
-            echo ""
-            echo "========================================="
-            echo "[$count] Processing: $filename"
-            
-            send_message "Downloading $count: ${filename}" "$CHAT_ID" "$BALE_BOT_TOKEN"
-            
-            DOWNLOAD_SUCCESS=false
-            
-            if aria2c -q -x4 -s4 --max-tries=5 --timeout=120 \
-              --dir="." --out="$filename" "$url" 2>/dev/null && [ -s "$filename" ]; then
-              DOWNLOAD_SUCCESS=true
-              echo "Downloaded with aria2c"
-            elif wget -q --tries=5 --timeout=60 -U "Mozilla/5.0" -O "$filename" "$url" 2>/dev/null && [ -s "$filename" ]; then
-              DOWNLOAD_SUCCESS=true
-              echo "Downloaded with wget"
-            elif curl -L -s --retry 5 --connect-timeout 30 -A "Mozilla/5.0" -o "$filename" "$url" && [ -s "$filename" ]; then
-              DOWNLOAD_SUCCESS=true
-              echo "Downloaded with curl"
+            # Extract filename
+            filename=$(basename "$url" | cut -d'?' -f1 | cut -d'#' -f1)
+            if [ -z "$filename" ]; then
+              filename="download_${count}.bin"
             fi
             
-            if [ "$DOWNLOAD_SUCCESS" = false ] || [ ! -s "$filename" ]; then
-              echo "FAILED: Could not download $filename"
-              send_message "Failed to download: ${filename}" "$CHAT_ID" "$BALE_BOT_TOKEN"
-              fail_count=$((fail_count + 1))
-              rm -f "$filename"
+            # Replace spaces and special chars
+            filename=$(echo "$filename" | sed 's/%20/_/g' | sed 's/[^a-zA-Z0-9._-]/_/g')
+            
+            echo "Filename: $filename"
+            send_message "شروع دانلود: $filename"
+            
+            # Download with multiple methods
+            downloaded=false
+            
+            # Method 1: aria2c
+            echo "Trying aria2c..."
+            aria2c -x4 -s4 --max-tries=3 --timeout=60 \
+              --dir="." --out="$filename" "$url" 2>&1 && [ -f "$filename" ] && [ -s "$filename" ] && downloaded=true
+            
+            # Method 2: wget
+            if [ "$downloaded" = false ]; then
+              echo "Trying wget..."
+              wget --tries=3 --timeout=30 -U "Mozilla/5.0" -O "$filename" "$url" 2>&1 && [ -f "$filename" ] && [ -s "$filename" ] && downloaded=true
+            fi
+            
+            # Method 3: curl
+            if [ "$downloaded" = false ]; then
+              echo "Trying curl..."
+              curl -L --retry 3 --connect-timeout 30 -A "Mozilla/5.0" -o "$filename" "$url" 2>&1 && [ -f "$filename" ] && [ -s "$filename" ] && downloaded=true
+            fi
+            
+            if [ "$downloaded" = false ]; then
+              echo "Failed to download: $filename"
+              send_message "خطا در دانلود: $filename"
               continue
             fi
             
-            size=$(stat -c%s "$filename")
-            size_mb=$((size / 1024 / 1024))
-            echo "Size: ${size_mb}MB"
+            # Get file size
+            size=$(stat -c%s "$filename" 2>/dev/null || echo 0)
+            size_mb=$((size / 1048576))
+            echo "Downloaded: $size_mb MB"
             
-            if [ "$size" -gt 94371840 ]; then
-              echo "File > 90MB, processing..."
-              
-              base="${filename%.*}"
-              ext="${filename##*.}"
-              ZIP_NAME="${base}.zip"
-              
-              if [ "$ext" = "zip" ] || [ "$ext" = "ZIP" ]; then
-                if [ "$filename" != "$ZIP_NAME" ]; then
-                  mv "$filename" "$ZIP_NAME"
-                fi
-              else
-                if [ -n "$PASSWORD" ]; then
-                  zip -P "$PASSWORD" "$ZIP_NAME" "$filename" 2>/dev/null
-                else
-                  zip "$ZIP_NAME" "$filename" 2>/dev/null
-                fi
-                
-                if [ -s "$ZIP_NAME" ]; then
-                  rm "$filename"
-                  filename="$ZIP_NAME"
-                fi
-              fi
-              
-              echo "Splitting into parts..."
-              PARTS_DIR="${base}_parts"
-              mkdir -p "$PARTS_DIR"
-              
-              if [ -f "$ZIP_NAME" ]; then
-                mv "$ZIP_NAME" "$PARTS_DIR/"
-                cd "$PARTS_DIR"
-                
-                split -b 45M -d "$ZIP_NAME" "part_"
-                
-                if [ $? -eq 0 ]; then
-                  rm "$ZIP_NAME"
-                  
-                  n=1
-                  for part in part_*; do
-                    new_name=$(printf "${base}.zip.%03d" $n)
-                    mv "$part" "$new_name"
-                    echo "Created: $new_name"
-                    n=$((n + 1))
-                  done
-                  
-                  total=$((n - 1))
-                  
-                  send_message "Split file: ${base}.zip - Parts: ${total}" "$CHAT_ID" "$BALE_BOT_TOKEN"
-                  
-                  part_num=1
-                  for part in *.zip.*; do
-                    echo "Sending part $part_num/$total: $part"
-                    
-                    if send_to_bale "$part" "Part ${part_num}/${total} of ${base}" "$CHAT_ID" "$BALE_BOT_TOKEN"; then
-                      success_count=$((success_count + 1))
-                    else
-                      fail_count=$((fail_count + 1))
-                    fi
-                    
-                    part_num=$((part_num + 1))
-                  done
-                  
-                  instructions="To join files: cat ${base}.zip.* > ${base}.zip"
-                  send_message "$instructions" "$CHAT_ID" "$BALE_BOT_TOKEN"
-                else
-                  echo "Split failed"
-                  cd ..
-                fi
-                cd ..
-              fi
+            send_message "دانلود شد: $filename ($size_mb MB)"
+            
+            # Send file if under 50MB
+            if [ "$size" -le 52428800 ]; then
+              echo "Sending file directly..."
+              send_document "$filename" "فایل: $filename"
             else
-              echo "File <= 90MB, sending directly..."
+              echo "File too large, creating ZIP parts..."
               
-              if [ "$size" -le 52428800 ]; then
-                if send_to_bale "$filename" "${filename}" "$CHAT_ID" "$BALE_BOT_TOKEN"; then
-                  success_count=$((success_count + 1))
-                else
-                  fail_count=$((fail_count + 1))
-                fi
+              # Create ZIP
+              base="${filename%.*}"
+              zip_name="${base}.zip"
+              
+              if [ -n "$PASSWORD" ]; then
+                zip -P "$PASSWORD" "$zip_name" "$filename" 2>/dev/null || true
               else
-                echo "File between 50-90MB, trying ZIP compression..."
+                zip "$zip_name" "$filename" 2>/dev/null || true
+              fi
+              
+              if [ -f "$zip_name" ] && [ -s "$zip_name" ]; then
+                rm -f "$filename"
                 
-                base="${filename%.*}"
-                COMPRESSED="${base}.zip"
+                # Split into parts
+                parts_dir="parts_${base}"
+                mkdir -p "$parts_dir"
+                mv "$zip_name" "$parts_dir/"
+                cd "$parts_dir"
                 
-                if [ -n "$PASSWORD" ]; then
-                  zip -P "$PASSWORD" -9 "$COMPRESSED" "$filename" 2>/dev/null
-                else
-                  zip -9 "$COMPRESSED" "$filename" 2>/dev/null
-                fi
+                split -b 45000000 -d "$zip_name" "part_" || {
+                  echo "Split failed, trying to send whole file"
+                  cd ..
+                  send_document "$parts_dir/$zip_name" "فایل فشرده: $zip_name"
+                  continue
+                }
                 
-                if [ -s "$COMPRESSED" ]; then
-                  compressed_size=$(stat -c%s "$COMPRESSED")
-                  if [ "$compressed_size" -le 52428800 ]; then
-                    rm "$filename"
-                    if send_to_bale "$COMPRESSED" "${base}.zip" "$CHAT_ID" "$BALE_BOT_TOKEN"; then
-                      success_count=$((success_count + 1))
-                    else
-                      fail_count=$((fail_count + 1))
-                    fi
-                  else
-                    mkdir -p "${base}_parts"
-                    mv "$COMPRESSED" "${base}_parts/"
-                    cd "${base}_parts"
-                    
-                    split -b 45M -d "$COMPRESSED" "part_"
-                    rm "$COMPRESSED"
-                    
-                    n=1
-                    for part in part_*; do
-                      new_name=$(printf "${base}.zip.%03d" $n)
-                      mv "$part" "$new_name"
-                      send_to_bale "$new_name" "Part ${n} of ${base}" "$CHAT_ID" "$BALE_BOT_TOKEN"
-                      n=$((n + 1))
-                    done
-                    cd ..
-                  fi
-                else
-                  send_to_bale "$filename" "${filename}" "$CHAT_ID" "$BALE_BOT_TOKEN"
-                fi
+                rm -f "$zip_name"
+                
+                # Rename and send parts
+                part_num=1
+                for part in part_*; do
+                  new_name=$(printf "%s.zip.%03d" "$base" $part_num)
+                  mv "$part" "$new_name"
+                  
+                  echo "Sending part $part_num: $new_name"
+                  send_document "$new_name" "بخش $part_num - $base"
+                  
+                  part_num=$((part_num + 1))
+                done
+                
+                # Send join instructions
+                total_parts=$((part_num - 1))
+                send_message "برای اتصال فایل ها از دستور زیر استفاده کنید: cat ${base}.zip.* > ${base}.zip"
+                
+                cd ..
+              else
+                echo "ZIP creation failed"
+                send_message "خطا در فشرده سازی فایل"
               fi
             fi
             
             echo "Completed: $filename"
-          done
+            
+          done < urls.txt
           
-          completion_message="Download completed!\n"
-          completion_message="${completion_message}Total: ${count}\n"
-          completion_message="${completion_message}Success: ${success_count}\n"
-          completion_message="${completion_message}Failed: ${fail_count}"
-          
+          # Send completion message
+          password_info=""
           if [ -n "$PASSWORD" ]; then
-            completion_message="${completion_message}\nPassword: ${PASSWORD}"
+            password_info="رمز فایل: $PASSWORD"
           fi
           
-          send_message "$completion_message" "$CHAT_ID" "$BALE_BOT_TOKEN"
+          send_message "عملیات دانلود به پایان رسید. $password_info"
           
+          # Cleanup
           cd /
           rm -rf "$TEMP_DIR"
           
-          echo ""
-          echo "=============================="
-          echo "All operations completed!"
-          echo "=============================="
-
-      - name: Final Status
+          echo "All done!"
+          
+      - name: Check Status
         if: always()
         run: |
-          echo "Workflow completed"
-          echo "Check your Bale bot for the files!"
+          echo "Workflow finished"
+          echo "Check your Bale messages"
